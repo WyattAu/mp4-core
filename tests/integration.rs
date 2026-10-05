@@ -737,62 +737,103 @@ fn a_track_without_a_tkhd_is_not_a_chapter_list() {
     ));
 }
 
+/// A `chpl` payload exactly as ffmpeg writes it, captured from a real file.
+///
+/// This is ground truth, not a fixture invented to match the code: the bytes came
+/// out of `ffmpeg -i src.wav -i chapters.ffmeta -c:a aac book.m4b`, and they are what
+/// TagLib documents. Building a fixture by hand from the Adobe FLV specification
+/// instead is how this crate came to read a `u32` count at offset 8 and fail on every
+/// real file.
+const FFMPEG_CHPL: &[u8] = &[
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0b, b'C', b'h', b'a', b'p', b't', b'e', b'r', 0x20, b'O', b'n', b'e', 0x00, 0x00, 0x00,
+    0x00, 0x23, 0xc3, b'F', 0x00, 0x0b, b'C', b'h', b'a', b'p', b't', b'e', b'r', 0x20, b'T', b'w',
+    b'o', 0x00, 0x00, 0x00, 0x00, b'G', 0x86, 0x8c, 0x00, 0x0d, b'C', b'h', b'a', b'p', b't', b'e',
+    b'r', 0x20, b'T', b'h', b'r', b'e', b'e',
+];
+
 #[test]
-fn a_real_world_chpl_version_zero_parses() {
-    // Real Nero-written M4Bs carry version 0, not the version 1 the Adobe FLV
-    // specification describes. An earlier version of this crate rejected them, so
-    // the chapter list of every real audiobook was silently lost — the file
-    // parsed fine, it just had no chapters, which is the worst kind of bug.
-    let mut payload = vec![0u8, 0, 0, 0]; // version 0, flags 0
-    payload.extend_from_slice(&[0u8; 4]); // reserved
-    payload.extend_from_slice(&1u32.to_be_bytes()); // one chapter
-    payload.extend_from_slice(&0u64.to_be_bytes()); // timestamp
+fn a_real_ffmpeg_chpl_parses() {
+    // The bug this pins: the count is a `u8` at offset 8, and version 1 puts four
+    // reserved bytes before it. A reader built from the Adobe FLV specification — which
+    // describes a `u32` count — reads 0x03000000 as the count, fails to walk the
+    // entries, and reports every real audiobook as having no chapters.
+    let list = ChapterList::parse_chpl(FFMPEG_CHPL).expect("real ffmpeg output parses");
+    assert_eq!(list.chapters.len(), 3);
+    assert_eq!(list.chapters[0].start_ms, 0);
+    assert_eq!(list.chapters[0].title, "Chapter One");
+    assert_eq!(list.chapters[1].start_ms, 60_000);
+    assert_eq!(list.chapters[1].title, "Chapter Two");
+    assert_eq!(list.chapters[2].start_ms, 120_000);
+    assert_eq!(list.chapters[2].title, "Chapter Three");
+}
+
+#[test]
+fn the_ffmpeg_payload_and_our_writer_agree() {
+    // Round-tripping through our own writer must produce the same bytes ffmpeg
+    // produces, or we are writing a file real players may not read.
+    let list = ChapterList::parse_chpl(FFMPEG_CHPL).expect("parses");
+    let written = list.to_chpl_payload();
+    assert_eq!(
+        written, FFMPEG_CHPL,
+        "our writer must produce byte-identical output to ffmpeg"
+    );
+    let bytes = list.to_chpl_box().to_bytes();
+    assert_eq!(
+        ChapterList::parse_chpl(&bytes[8..])
+            .expect("reparses")
+            .chapters,
+        list.chapters
+    );
+}
+
+#[test]
+fn a_version_zero_chpl_has_no_reserved_bytes() {
+    // Version 0's header is five bytes, not nine — the reserved field is absent, so a
+    // reader that always skips four bytes reads the count from the wrong place.
+    let mut payload: Vec<u8> = vec![0u8, 0, 0, 0]; // version 0, flags 0
+    payload.push(1); // count at offset 4 — no reserved field before it
+    payload.extend_from_slice(&0u64.to_be_bytes()); // start 0
     payload.push(5);
     payload.extend_from_slice(b"First");
 
-    let list = ChapterList::parse_chpl(&payload).expect("version 0 is the real-world form");
+    let list = ChapterList::parse_chpl(&payload).expect("version 0 parses");
     assert_eq!(list.chapters.len(), 1);
     assert_eq!(list.chapters[0].title, "First");
 }
 
 #[test]
-fn a_chpl_version_one_also_parses() {
-    // What the specification describes, still read for completeness.
-    let list = ChapterList {
-        chapters: vec![Chapter::new(0, "One"), Chapter::new(60_000, "Two")],
-    };
-    let mut payload = list.to_chpl_payload();
-    payload[3] = 1; // claim version 1
+fn a_specification_shaped_count_yields_an_empty_list_not_a_wrong_one() {
+    // The Adobe FLV layout: a four-byte big-endian count of 3, so the bytes are
+    // `00 00 00 03` where the real format puts `03 00 00 00`.
+    //
+    // Read by the real rules the count byte is `0x00`, so the list is empty — and an
+    // empty list is *valid*. This test exists to pin that failure mode rather than
+    // pretend it is detectable: a specification-following writer produces a box that
+    // reads as "no chapters" with nothing to distinguish it from a book that truly has
+    // none. That is precisely why this crate reads the layout ffmpeg and TagLib use
+    // instead of the one the specification describes.
+    let mut payload: Vec<u8> = vec![1u8, 0, 0, 0];
+    payload.extend_from_slice(&[0u8; 4]);
+    payload.extend_from_slice(&3u32.to_be_bytes());
+    payload.extend_from_slice(&[0u8; 30]); // the chapters the count would have described
 
-    let back = ChapterList::parse_chpl(&payload).expect("version 1 parses");
-    assert_eq!(back.chapters.len(), 2);
-    assert_eq!(back.chapters[1].title, "Two");
-}
-
-#[test]
-fn this_crate_writes_the_version_real_files_carry() {
-    // Writing version 1 because the specification says so would produce output a
-    // version-1-only reader accepts but no real Nero player has been tested
-    // against. Matching the observed world is the safer default.
-    let list = ChapterList {
-        chapters: vec![Chapter::new(0, "One")],
-    };
-    let payload = list.to_chpl_payload();
-    assert_eq!(
-        payload.get(..4),
-        Some(&[0u8, 0, 0, 0][..]),
-        "version 0, which is what real files carry"
+    let list = ChapterList::parse_chpl(&payload).expect("a zero count is not malformed");
+    assert!(
+        list.chapters.is_empty(),
+        "read as empty rather than as three nonsense chapters"
     );
 }
 
 #[test]
-fn a_chpl_version_newer_than_known_is_rejected() {
-    // A future layout is refused rather than misparsed, which is a different
-    // failure from the common version 0 and is worth refusing.
-    // The version is the first *byte*; the next three are flags.
-    let mut payload = vec![2u8, 0, 0, 0]; // version 2
+fn a_count_larger_than_the_box_is_rejected_not_truncated() {
+    // Clamping would silently drop chapters, which is the worst outcome available.
+    let mut payload: Vec<u8> = vec![1u8, 0, 0, 0];
     payload.extend_from_slice(&[0u8; 4]);
-    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.push(200); // claims 200 chapters
+    payload.extend_from_slice(&0u64.to_be_bytes());
+    payload.push(1);
+    payload.extend_from_slice(b"One");
     assert!(matches!(
         ChapterList::parse_chpl(&payload),
         Err(mp4_core::Mp4Error::MalformedChapters { .. })
@@ -800,10 +841,10 @@ fn a_chpl_version_newer_than_known_is_rejected() {
 }
 
 #[test]
-fn a_chpl_box_with_a_nonzero_reserved_field_is_rejected() {
-    let mut payload = vec![0u8, 0, 0, 1];
+fn a_nonzero_reserved_field_is_rejected_for_version_one() {
+    let mut payload: Vec<u8> = vec![1u8, 0, 0, 0];
     payload.extend_from_slice(&[0u8, 0, 0, 1]); // reserved must be zero
-    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.push(0); // count 0 — no entries, so only the reserved field is at issue
     assert!(matches!(
         ChapterList::parse_chpl(&payload),
         Err(mp4_core::Mp4Error::MalformedChapters { .. })
@@ -811,17 +852,91 @@ fn a_chpl_box_with_a_nonzero_reserved_field_is_rejected() {
 }
 
 #[test]
-fn a_chpl_title_running_past_the_box_is_rejected() {
-    let mut payload = vec![0u8, 0, 0, 1];
+fn a_title_running_past_the_box_is_rejected() {
+    let mut payload: Vec<u8> = vec![1u8, 0, 0, 0];
     payload.extend_from_slice(&[0u8; 4]);
-    payload.extend_from_slice(&1u32.to_be_bytes()); // one entry
-    payload.extend_from_slice(&0u64.to_be_bytes()); // timestamp
+    payload.push(1); // one chapter
+    payload.extend_from_slice(&0u64.to_be_bytes());
     payload.push(200); // claims a 200-byte title
     payload.extend_from_slice(b"short"); // only 5 bytes follow
     assert!(matches!(
         ChapterList::parse_chpl(&payload),
         Err(mp4_core::Mp4Error::MalformedChapters { .. })
     ));
+}
+
+#[test]
+fn a_chpl_version_newer_than_known_is_rejected() {
+    let mut payload: Vec<u8> = vec![2u8, 0, 0, 0];
+    payload.extend_from_slice(&[0u8; 4]);
+    payload.push(0);
+    assert!(matches!(
+        ChapterList::parse_chpl(&payload),
+        Err(mp4_core::Mp4Error::MalformedChapters { .. })
+    ));
+}
+
+#[test]
+fn a_truncated_header_is_rejected_rather_than_read() {
+    assert!(ChapterList::parse_chpl(&[]).is_err());
+    assert!(ChapterList::parse_chpl(&[1, 0, 0]).is_err());
+    // Version 1 with no room for its reserved field.
+    assert!(ChapterList::parse_chpl(&[1, 0, 0, 0, 0, 0]).is_err());
+}
+
+#[test]
+fn an_empty_chapter_list_is_legal() {
+    let mut payload: Vec<u8> = vec![1u8, 0, 0, 0];
+    payload.extend_from_slice(&[0u8; 4]);
+    payload.push(0);
+    let list = ChapterList::parse_chpl(&payload).expect("a zero count is valid");
+    assert!(list.chapters.is_empty());
+}
+
+#[test]
+fn the_255_chapter_ceiling_is_reported_rather_than_silently_applied() {
+    use mp4_core::{MAX_CHPL_CHAPTERS, MAX_CHPL_TITLE_BYTES};
+
+    let many: Vec<Chapter> = (0..MAX_CHPL_CHAPTERS)
+        .map(|i| Chapter::new(i as u64 * 1_000, "x"))
+        .collect();
+    let ok = ChapterList {
+        chapters: many.clone(),
+    }
+    .to_chpl_box_checked()
+    .expect("255 chapters fit");
+    assert!(ok.box_type == *b"chpl");
+
+    // One more than the count field can express.
+    let mut too_many = many;
+    too_many.push(Chapter::new(999_000, "x"));
+    assert!(matches!(
+        ChapterList { chapters: too_many }.to_chpl_box_checked(),
+        Err(mp4_core::Mp4Error::MalformedChapters { .. })
+    ));
+
+    // A title longer than the length field can express.
+    let long = "a".repeat(MAX_CHPL_TITLE_BYTES + 1);
+    assert!(matches!(
+        ChapterList {
+            chapters: vec![Chapter::new(0, &long)]
+        }
+        .to_chpl_box_checked(),
+        Err(mp4_core::Mp4Error::MalformedChapters { .. })
+    ));
+}
+
+#[test]
+fn a_title_at_the_length_ceiling_is_kept_whole() {
+    use mp4_core::MAX_CHPL_TITLE_BYTES;
+    let title = "b".repeat(MAX_CHPL_TITLE_BYTES);
+    let box_ = ChapterList {
+        chapters: vec![Chapter::new(0, &title)],
+    }
+    .to_chpl_box_checked()
+    .expect("a title at the ceiling fits");
+    let back = ChapterList::parse_chpl(&box_.payload).expect("reparses");
+    assert_eq!(back.chapters[0].title, title, "not truncated");
 }
 
 #[test]

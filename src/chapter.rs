@@ -26,10 +26,19 @@ use alloc::vec::Vec;
 
 use crate::container::{leaf, Box_};
 use crate::error::Mp4Error;
-use crate::fields::{u32_at, u64_at, u8_at};
+use crate::fields::{u32_at, u64_at};
 
 /// Nanoseconds per `chpl` tick.
 pub const CHPL_TICKS_PER_SECOND: u64 = 10_000_000;
+
+/// The most chapters a `chpl` box can hold, because its count field is a `u8`.
+///
+/// A format ceiling, not a policy choice. Players have been observed to fail above
+/// it — see the note in [`ChapterList::parse_chpl`].
+pub const MAX_CHPL_CHAPTERS: usize = 255;
+
+/// The most bytes a `chpl` chapter title can hold, for the same reason.
+pub const MAX_CHPL_TITLE_BYTES: usize = 255;
 
 /// One chapter: a start time and a title.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -106,32 +115,52 @@ impl ChapterList {
 
     /// Parse a `chpl` box payload.
     ///
-    /// # The version byte is 0 in the wild, not 1
+    /// # The layout, which is not what the Adobe FLV specification says
     ///
-    /// The Adobe FLV specification that `chpl` derives from describes version 1,
-    /// but the format is a Nero extension and **real files carry version 0**.
-    /// Inspecting a real 20-hour M4B's chapter box gives:
+    /// The FLV specification the format derives from describes
+    /// `version(1) flags(3) reserved(4) chapter_count(4)`. TagLib — the reference
+    /// implementation for this box — writes and reads it as:
     ///
     /// ```text
-    /// chpl: version: 0, flags: 0, chapters: 54
+    /// version(1) flags(3) [reserved(4) if version >= 1] chapter_count(1)
     /// ```
     ///
-    /// An earlier version of this crate rejected anything but 1 and therefore
-    /// silently lost the chapter list of every Nero-written audiobook — the
-    /// failure was invisible because the file parsed fine, just with no chapters.
-    /// Both 0 and 1 are accepted; a higher version is rejected because its layout
-    /// is unknown, not because it is uncommon.
+    /// Two differences, both of which make a reader built from the specification
+    /// fail on every real file:
+    ///
+    /// 1. **The count is one byte, not four.** It is not a quirk but the format's
+    ///    limit: 255 chapters, because the count is a `u8`. A reader that reads four
+    ///    bytes gets `0x03000000` where the answer is `3`, then walks off the end of
+    ///    the box and reports the chapter list as malformed.
+    /// 2. **The reserved bytes are absent when the version is 0**, making that
+    ///    header five bytes rather than nine.
+    ///
+    /// This crate had exactly that specification-derived bug: it read a `u32` count
+    /// at a fixed offset, so it could not read a single real `chpl` box — only ones it
+    /// had written itself. It was found by generating a chapter list with ffmpeg and
+    /// reading it back, which no amount of self-consistent testing would have caught.
+    ///
+    /// Both versions are accepted. A version above 1 is refused, because its layout is
+    /// unknown rather than merely uncommon.
+    ///
+    /// # The 255-chapter ceiling
+    ///
+    /// Because the count is a `u8`, a book with more chapters than that cannot be
+    /// written in this format at all — not by this crate, not by any other. Players
+    /// have been observed to fail above that ceiling. [`ChapterList::to_chpl_payload`]
+    /// refuses to silently drop chapters for this reason; a caller needing more
+    /// should use the QuickTime chapter-track form instead.
     ///
     /// # Errors
     ///
-    /// [`Mp4Error::MalformedChapters`] when the reserved bytes are wrong, the
-    /// entry count does not match the payload, or a title is unterminated.
+    /// [`Mp4Error::MalformedChapters`] when the header is too short, the count
+    /// exceeds what the box can hold, or a title runs past the end.
     pub fn parse_chpl(payload: &[u8]) -> Result<ChapterList, Mp4Error> {
-        // Layout: 4-byte version | 4-byte reserved (must be 0) | 4-byte entry
-        // count | per entry: 8-byte timestamp | 1-byte title length | title bytes.
-        if payload.len() < 12 {
+        // version(1) flags(3) count(1) = 5 bytes minimum; version 1 adds 4 reserved.
+        const MIN_HEADER: usize = 5;
+        if payload.len() < MIN_HEADER {
             return Err(Mp4Error::MalformedChapters {
-                reason: "header is shorter than 12 bytes",
+                reason: "header is shorter than 5 bytes",
             });
         }
         let ver = payload.first().copied().unwrap_or(u8::MAX);
@@ -140,20 +169,47 @@ impl ChapterList {
                 reason: "chpl version is newer than the layout this crate knows",
             });
         }
-        // Bytes 4..8 are reserved and must be zero.
-        if payload.get(4..8).is_some_and(|r| r.iter().any(|b| *b != 0)) {
+        let mut offset = 4usize;
+        if ver >= 1 {
+            // Version 1 carries four reserved bytes between the flags and the count.
+            let Some(reserved) = payload.get(offset..offset + 4) else {
+                return Err(Mp4Error::MalformedChapters {
+                    reason: "version 1 header is truncated before its reserved field",
+                });
+            };
+            if reserved.iter().any(|b| *b != 0) {
+                return Err(Mp4Error::MalformedChapters {
+                    reason: "reserved field is not zero",
+                });
+            }
+            offset += 4;
+        }
+        let count = payload.get(offset).copied().unwrap_or(0) as usize;
+        offset += 1;
+
+        // A count that cannot fit is a malformed box rather than a chapter list to
+        // truncate: every entry needs at least 9 bytes, so a count beyond that is
+        // certainly wrong and silently clamping it would drop chapters.
+        let minimum_entry = 9usize;
+        if count.saturating_mul(minimum_entry) > payload.len().saturating_sub(offset) {
             return Err(Mp4Error::MalformedChapters {
-                reason: "reserved field is not zero",
+                reason: "chapter count cannot fit in the box",
             });
         }
-        let count = u32_at(payload, 8, "chpl entry count")?;
-        let mut chapters = Vec::with_capacity(count.min(1024) as usize);
-        let mut offset = 12usize;
 
+        let mut chapters = Vec::with_capacity(count);
         for _ in 0..count {
-            let ticks = u64_at(payload, offset, "chapter timestamp")?;
+            let Some(raw) = payload
+                .get(offset..offset + 8)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            else {
+                return Err(Mp4Error::MalformedChapters {
+                    reason: "chapter timestamp runs past the end of the box",
+                });
+            };
+            let ticks = u64::from_be_bytes(raw);
             offset += 8;
-            let len = u8_at(payload, offset, "chapter title length")? as usize;
+            let len = payload.get(offset).copied().unwrap_or(0) as usize;
             offset += 1;
             let title_bytes =
                 payload
@@ -161,8 +217,11 @@ impl ChapterList {
                     .ok_or(Mp4Error::MalformedChapters {
                         reason: "chapter title runs past the end of the box",
                     })?;
-            // Nero writes titles as UTF-8; some muxers wrote Latin-1. Decode as
-            // UTF-8 and fall back to Latin-1 rather than failing the whole list.
+            offset += len;
+
+            // Nero writes titles as UTF-8; some muxers wrote Latin-1. Decode as UTF-8
+            // and fall back to Latin-1 rather than failing the whole list, because a
+            // book with one mis-encoded title is still a readable book.
             let title = match core::str::from_utf8(title_bytes) {
                 Ok(s) => String::from(s),
                 Err(_) => title_bytes.iter().map(|b| char::from(*b)).collect(),
@@ -171,29 +230,35 @@ impl ChapterList {
                 start_ms: ticks / (CHPL_TICKS_PER_SECOND / 1000),
                 title,
             });
-            offset += len;
         }
 
         Ok(ChapterList { chapters })
     }
 
-    /// Serialize to a `chpl` payload.
+    /// Serialize to a `chpl` payload, as version 1.
     ///
-    /// **Emits version 0**, matching what Nero writes and what real files carry,
-    /// even though the Adobe FLV specification the format derives from describes
-    /// version 1. A reader that only accepts version 1 would reject our output,
-    /// and the version-1 population is hypothetical while version 0 is observed.
-    /// Both are accepted on the way in.
+    /// Version 1 is what ffmpeg writes and what TagLib reads, and it is the layout
+    /// with the documented reserved field. Version 0 — a five-byte header with no
+    /// reserved bytes — is still accepted on the way in, because real files carry
+    /// it.
     ///
-    /// Titles longer than 255 bytes are truncated, because the format's title
-    /// length is a single byte. That is a format limit, not a policy choice, and
-    /// it is the one place this crate silently loses data.
+    /// # Two format limits, both silent unless you look for them
+    ///
+    /// - **At most 255 chapters.** The count is a `u8`, so this is the format's
+    ///   ceiling rather than this crate's. A longer list is *dropped* on the way out,
+    ///   so [`ChapterList::to_chpl_box_checked`] exists to refuse instead.
+    /// - **Titles are truncated at 255 bytes**, because a title's length field is
+    ///   also a `u8`.
+    ///
+    /// Both are unavoidable in this format; a caller who needs more should use the
+    /// QuickTime chapter-track form, which has no such ceilings.
     #[must_use]
     pub fn to_chpl_payload(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(16 + self.chapters.len() * 24);
-        out.extend_from_slice(&[0u8, 0, 0, 0]); // version 0, flags 0
+        out.push(1); // version 1
+        out.extend_from_slice(&[0u8, 0, 0]); // flags
         out.extend_from_slice(&[0u8; 4]); // reserved
-        out.extend_from_slice(&(self.chapters.len() as u32).to_be_bytes());
+        out.push(u8::try_from(self.chapters.len()).unwrap_or(u8::MAX)); // count
         for c in &self.chapters {
             let ticks = c.start_ms.saturating_mul(CHPL_TICKS_PER_SECOND / 1000);
             out.extend_from_slice(&ticks.to_be_bytes());
@@ -203,6 +268,33 @@ impl ChapterList {
             out.extend_from_slice(bytes.get(..len).unwrap_or(&[]));
         }
         out
+    }
+
+    /// Serialize to a `chpl` box, refusing anything the format cannot hold.
+    ///
+    /// # Errors
+    ///
+    /// [`Mp4Error::MalformedChapters`] when there are more than 255 chapters or a
+    /// title is longer than 255 bytes. This is the form to prefer for a *write* path:
+    /// `to_chpl_box` truncates silently, and a library that quietly drops the last
+    /// forty chapters of a long book is worse than one that reports it cannot store
+    /// them.
+    pub fn to_chpl_box_checked(&self) -> Result<Box_, Mp4Error> {
+        if self.chapters.len() > MAX_CHPL_CHAPTERS {
+            return Err(Mp4Error::MalformedChapters {
+                reason: "more chapters than the chpl count field can express",
+            });
+        }
+        if self
+            .chapters
+            .iter()
+            .any(|c| c.title.len() > MAX_CHPL_TITLE_BYTES)
+        {
+            return Err(Mp4Error::MalformedChapters {
+                reason: "a chapter title is longer than the chpl length field can express",
+            });
+        }
+        Ok(self.to_chpl_box())
     }
 
     /// Build a complete `chpl` box.

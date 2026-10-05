@@ -3,6 +3,46 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+## [0.2.1] - 2026-10-05
+
+The `chpl` reader was built from the Adobe FLV specification and could not read a
+single real chapter list. Found by generating one with ffmpeg and reading it back —
+a bug no amount of self-consistent testing could have caught, since the only `chpl`
+boxes the test suite had ever parsed were ones this crate had written itself.
+
+### Fixed
+
+1. **The chapter count is one byte, not four.** The FLV specification the format
+   derives from describes `chapter_count(4)`. TagLib, the reference implementation,
+   reads and writes `chapter_count(1)`, and it is not a quirk: a `u8` *is* the
+   format's 255-chapter ceiling. Reading four bytes yields `0x03000000` where the
+   answer is `3`, the entry walk then runs off the end of the box, and every real
+   Nero chapter list is reported as malformed.
+2. **Version 0 has no reserved bytes.** Version 1's header is nine bytes
+   (`version` `flags` `reserved(4)` `count`); version 0's is five. A reader that
+   always skips four reads the count from the wrong offset for every version-0 file.
+
+`to_chpl_payload` now emits version 1 — the layout ffmpeg writes and TagLib reads —
+and a test asserts our output is **byte-identical** to ffmpeg's, so a divergence
+between this crate and the most widely deployed writer fails loudly rather than
+producing files real players might reject.
+
+### Added
+
+- `MAX_CHPL_CHAPTERS` (255) and `MAX_CHPL_TITLE_BYTES` (255), both format ceilings
+  rather than policy choices, documented with the observation that players have been
+  seen to fail above the chapter ceiling.
+- `ChapterList::to_chpl_box_checked`, which **refuses** a list the format cannot hold
+  rather than truncating it. `to_chpl_box` keeps the truncating behaviour for
+  compatibility, because a library that silently drops the last forty chapters of a
+  long book is worse than one that reports it cannot store them.
+- Tests built from **real captured ffmpeg bytes** rather than hand-written fixtures,
+  including one that pins the specification-shaped count reading as an empty list —
+  the failure mode a specification-following writer produces, which is otherwise
+  indistinguishable from a book with genuinely no chapters.
+- A parser guard: a count that cannot fit the box is an error rather than a clamp,
+  since clamping drops chapters silently.
+
 ## [0.2.0] - 2026-10-05
 
 Chapter handling corrected against Apple's QuickTime File Format documentation,
