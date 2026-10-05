@@ -3,6 +3,62 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+## [0.2.0] - 2026-10-05
+
+Chapter handling corrected against Apple's QuickTime File Format documentation,
+Apple Technical Note TN2174, and inspection of real Nero-written M4Bs. Four of
+these are defects that made the crate silently wrong on real files.
+
+### Fixed
+
+1. **Real `chpl` boxes are version 0, not version 1.** The Adobe FLV specification
+   the format derives from describes version 1, but inspecting a real 20-hour M4B
+   gives `chpl: version: 0, flags: 0, chapters: 54`. This crate required version 1
+   and therefore **discarded the chapter list of every Nero-written audiobook** —
+   and did so invisibly, because the file parsed fine and simply had no chapters.
+   Both 0 and 1 are now accepted; only a version newer than either is refused,
+   since its layout is unknown rather than merely uncommon.
+   `to_chpl_payload` now emits version 0, matching the observed world: the
+   version-1 population is hypothetical while version 0 is what players have been
+   tested against.
+2. **Chapter text samples begin with a two-byte length prefix.** Apple's QTFF and
+   TN2174 both specify the sample as a 16-bit big-endian length followed by the
+   text, with no null terminator — "Chapter 1" is ten bytes, `00 09` then the text.
+   Reading the whole sample as text returned a title beginning with two NULs, which
+   every UI renders as `\ufffd\ufffdChapter 1`. The prefix is now stripped when it
+   is consistent with the sample and ignored when it is not, so the encoders that
+   write bare text still read.
+3. **A text track is not a chapter track.** Apple's QTFF is explicit: "It is the
+   'chap' track reference that makes the text track into a chapter list." An M4B
+   with subtitles, captions, or lyrics has a text track that is not one, and
+   `Mp4File::chapter_track` returned it. `chapter::is_chapter_list` now resolves
+   the reference properly, including the asymmetry that is easy to get backwards:
+   the **referencing** track must be enabled, while the chapter track itself
+   "does not need to be enabled, and normally is not".
+   `Mp4File::chapter_track_id` exposes the resolved id.
+4. **`tref` was not in the container set**, so no track reference was ever
+   reachable and the fix above had nothing to read.
+
+### Added
+
+- `chapter::is_chapter_list` — resolves a `chap` reference against the movie,
+  accepting both the `tref` form and a bare `chap` under `udta` that some muxers
+  emit.
+- `Mp4File::chapter_track_id` — the resolved chapter track, or `None`.
+- Tests for all of the above, including one that had previously **asserted the
+  bug**: `a_chapter_track_marks_a_file_as_an_audiobook` treated any text track as
+  chapters and now pins the correct behaviour in both directions.
+
+### Known limitations
+
+- **Chapter samples are assumed contiguous** from the first chunk offset. True for
+  the single-chunk table a chapter track almost always has, not for one
+  interleaved across several chunks. Reading `stsc` is the next step; until then
+  this yields garbage titles rather than an error, so it is documented rather than
+  hidden.
+- **`nmhd` vs `gmhd` is not distinguished.** TN2174's chapter marker track uses a
+  Null Media Header where a QuickTime text track uses a Generic one; both parse.
+
 ## [0.1.0] - 2026-10-05
 
 First release. `mp4-core` is the estate's L0 MP4 container layer, the ISO-BMFF

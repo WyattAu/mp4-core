@@ -32,6 +32,58 @@ fn audio_moov_with(movie_ts: u32, track_ts: u32, duration_ms: u64) -> Vec<u8> {
     container(*b"moov", vec![mvhd, trak]).to_bytes()
 }
 
+/// An `M4B`-shaped file carrying only a `chpl` chapter list.
+fn file_with_chpl(chapters: &[(&str, u64)]) -> Vec<u8> {
+    let list = mp4_core::ChapterList {
+        chapters: chapters
+            .iter()
+            .map(|(t, ms)| mp4_core::Chapter::new(*ms, t))
+            .collect(),
+    };
+    let mvhd = leaf(*b"mvhd", MovieHeader::to_payload(1000, 10_000)).expect("infallible");
+    let moov = container(
+        *b"moov",
+        vec![mvhd, audio_trak(1, 44_100, 10_000), list.to_chpl_box()],
+    );
+    let mut data = leaf(*b"ftyp", FileType::audiobook().to_payload())
+        .expect("infallible")
+        .to_bytes();
+    data.extend_from_slice(&moov.to_bytes());
+    data.extend_from_slice(
+        &leaf(*b"mdat", vec![0u8; 32])
+            .expect("infallible")
+            .to_bytes(),
+    );
+    data
+}
+
+/// A `trak` whose `tkhd` enabled flag can be toggled.
+///
+/// Apple's chapter-list rule turns on which track carries the `tref`, so the tests
+/// need both states of the same track.
+trait ToggleEnabled {
+    fn with_enabled(self, enabled: bool) -> Self;
+}
+
+impl ToggleEnabled for mp4_core::Box_ {
+    fn with_enabled(mut self, enabled: bool) -> Self {
+        if let Some(tkhd) = self.child(*b"tkhd") {
+            let mut payload = tkhd.payload.clone();
+            // Byte 0 is the version; flags occupy bytes 1..4, so bit 0 of the
+            // flags word is the low bit of byte **3**. Clearing byte 2 would look
+            // plausible and change nothing.
+            if let Some(byte) = payload.get_mut(3) {
+                *byte = if enabled { *byte | 0b1 } else { *byte & 0xFE };
+            }
+            let rebuilt = leaf(*b"tkhd", payload).expect("infallible");
+            if let Some(slot) = self.children.iter_mut().find(|c| c.box_type == *b"tkhd") {
+                *slot = rebuilt;
+            }
+        }
+        self
+    }
+}
+
 /// One audio `trak`: `tkhd`, `mdia`/`mdhd`, `mdia`/`hdlr`, `mdia`/`minf`/`stbl`.
 fn audio_trak(track_id: u32, timescale: u32, duration_ms: u64) -> mp4_core::Box_ {
     let mut tkhd_payload = vec![0u8, 0, 0, 3]; // version 0, flags: enabled|in-movie
@@ -70,8 +122,11 @@ fn audio_trak(track_id: u32, timescale: u32, duration_ms: u64) -> mp4_core::Box_
 }
 
 /// A text `trak`, which is how the QuickTime chapter form stores titles.
+///
+/// **Disabled**, per Apple: the chapter track "does not need to be enabled, and
+/// normally is not". The *referencing* media track is the one whose flag matters.
 fn text_trak(track_id: u32) -> mp4_core::Box_ {
-    let mut tkhd_payload = vec![0u8, 0, 0, 3];
+    let mut tkhd_payload = vec![0u8, 0, 0, 0]; // flags 0: not enabled
     tkhd_payload.extend_from_slice(&0u32.to_be_bytes());
     tkhd_payload.extend_from_slice(&0u32.to_be_bytes());
     tkhd_payload.extend_from_slice(&track_id.to_be_bytes());
@@ -94,6 +149,20 @@ fn text_trak(track_id: u32) -> mp4_core::Box_ {
     let minf = container(*b"minf", vec![container(*b"stbl", vec![])]);
     let mdia = container(*b"mdia", vec![mdhd, hdlr, minf]);
     container(*b"trak", vec![tkhd, mdia])
+}
+
+/// An audio track carrying a `tref`/`chap` reference to `target`.
+///
+/// The reference belongs on the **referencing** track, not on the chapter track:
+/// Apple puts it on the enabled media track, pointing at the text track. That
+/// direction is easy to get backwards, and the first version of this test did.
+fn audio_trak_referencing(target: u32, timescale: u32, duration_ms: u64) -> mp4_core::Box_ {
+    let mut track = audio_trak(1, timescale, duration_ms);
+    track.children.push(container(
+        *b"tref",
+        vec![leaf(*b"chap", target.to_be_bytes().to_vec()).expect("infallible")],
+    ));
+    track
 }
 
 #[test]
@@ -231,9 +300,39 @@ fn a_file_with_metadata_and_chapters_round_trips() {
 }
 
 #[test]
-fn a_chapter_track_marks_a_file_as_an_audiobook() {
-    // No stik, no M4B brand, no chpl — only a text track. That is still an
-    // audiobook as far as a player is concerned.
+fn a_referenced_chapter_track_marks_a_file_as_an_audiobook() {
+    // No stik, no M4B brand, no chpl — only a QuickTime chapter track. That is
+    // still an audiobook as far as a player is concerned.
+    let mvhd = leaf(*b"mvhd", MovieHeader::to_payload(1000, 60_000)).expect("infallible");
+    let moov = container(
+        *b"moov",
+        vec![
+            mvhd,
+            audio_trak_referencing(2, 44_100, 60_000),
+            text_trak(2),
+        ],
+    );
+    let mut data = leaf(*b"ftyp", FileType::audiobook().to_payload())
+        .expect("infallible")
+        .to_bytes();
+    data.extend_from_slice(&moov.to_bytes());
+
+    let file = Mp4File::parse(&data).expect("parses");
+    assert_eq!(file.tracks.len(), 2);
+    assert_eq!(file.chapter_track_id, Some(2));
+    assert_eq!(
+        file.chapter_track().map(|t| t.header.track_id),
+        Some(2),
+        "the referenced track is the chapter track"
+    );
+    assert!(file.is_audiobook(), "a chapter track marks an audiobook");
+}
+
+#[test]
+fn a_subtitle_track_is_not_a_chapter_track() {
+    // The same file without the `chap` reference: a text track, but not chapters.
+    // This test previously asserted the opposite, which is the bug — a reader that
+    // treats any text track as chapters puts a subtitle list in the chapter menu.
     let mvhd = leaf(*b"mvhd", MovieHeader::to_payload(1000, 60_000)).expect("infallible");
     let moov = container(
         *b"moov",
@@ -245,9 +344,36 @@ fn a_chapter_track_marks_a_file_as_an_audiobook() {
     data.extend_from_slice(&moov.to_bytes());
 
     let file = Mp4File::parse(&data).expect("parses");
-    assert_eq!(file.tracks.len(), 2);
-    assert!(file.chapter_track().is_some());
-    assert!(file.is_audiobook(), "a text track alone marks an audiobook");
+    assert_eq!(file.tracks.len(), 2, "the text track is still parsed");
+    assert_eq!(
+        file.chapter_track_id, None,
+        "but nothing says it carries chapters"
+    );
+    assert!(
+        file.chapter_track().is_none(),
+        "a subtitle track is not a chapter track"
+    );
+}
+
+#[test]
+fn the_two_chapter_mechanisms_are_independent() {
+    // Real files carry `chpl`, a QuickTime chapter track, or both — and a report on
+    // M4B chapters in the wild notes some files have "only one or the other, some
+    // have both". So neither mechanism may be inferred from the other's presence.
+    let with_chpl_only = file_with_chpl(&[("A", 0u64), ("B", 1_000)]);
+    let file = Mp4File::parse(&with_chpl_only).expect("parses");
+    assert_eq!(file.chapters.chapters.len(), 2);
+    assert_eq!(file.chapter_track_id, None, "no text track at all");
+    assert!(file.is_audiobook(), "`chpl` alone is enough");
+
+    let neither = file_with_chpl(&[]);
+    let file = Mp4File::parse(&neither).expect("parses");
+    assert!(file.chapters.chapters.is_empty());
+    assert_eq!(file.chapter_track_id, None);
+    // Still an audiobook by brand alone — which is why `is_audiobook` ORs its
+    // signals rather than chaining them. A file can carry `M4B ` with no chapters,
+    // and reporting "not an audiobook" would be as wrong as the reverse.
+    assert!(file.is_audiobook(), "the M4B brand alone still marks it");
 }
 
 #[test]
@@ -482,8 +608,189 @@ fn a_conformant_stsd_entry_yields_the_sample_rate() {
 }
 
 #[test]
-fn a_chpl_box_with_a_wrong_version_is_rejected() {
-    let mut payload = vec![0u8, 0, 0, 2]; // version 2, not 1
+fn a_chapter_sample_length_prefix_is_stripped() {
+    // Apple's QuickTime File Format and TN2174 both specify the sample as a 16-bit
+    // big-endian length followed by the text, with no null terminator. Reading the
+    // whole sample as text yields a title starting with two NULs, which renders as
+    // "..Chapter 1" in every UI — a corruption that is easy to miss because the
+    // name is still recognisable.
+    let mut sample = 9u16.to_be_bytes().to_vec();
+    sample.extend_from_slice(b"Chapter 1");
+    assert_eq!(
+        mp4_core::chapter::decode_text_sample(&sample),
+        "Chapter 1",
+        "the length prefix must not reach the caller"
+    );
+
+    // A longer title, where the prefix genuinely differs from the sample length.
+    let title = "The Inimitable Aardvark";
+    let mut sample = (title.len() as u16).to_be_bytes().to_vec();
+    sample.extend_from_slice(title.as_bytes());
+    assert_eq!(mp4_core::chapter::decode_text_sample(&sample), title);
+}
+
+#[test]
+fn a_bare_text_sample_without_a_prefix_still_reads() {
+    // Some encoders write the text with no length prefix. Trusting the first two
+    // bytes blindly would turn the title's own first character into a length, so
+    // an inconsistent prefix is ignored rather than obeyed.
+    assert_eq!(
+        mp4_core::chapter::decode_text_sample(b"Chapter 1"),
+        "Chapter 1",
+        "a prefix claiming more than the sample holds is not a prefix"
+    );
+    // A prefix that claims *less* than the sample holds is honoured, since the
+    // rest would be padding.
+    let mut sample = 4u16.to_be_bytes().to_vec();
+    sample.extend_from_slice(b"Open   ");
+    assert_eq!(mp4_core::chapter::decode_text_sample(&sample), "Open");
+}
+
+#[test]
+fn a_chapter_sample_in_utf16_is_decoded_with_its_prefix() {
+    let title = "Chapitre";
+    let mut text = vec![0xFFu8, 0xFE]; // little-endian BOM
+    for unit in title.encode_utf16() {
+        text.extend_from_slice(&unit.to_le_bytes());
+    }
+    let mut sample = (text.len() as u16).to_be_bytes().to_vec();
+    sample.extend_from_slice(&text);
+
+    let decoded = mp4_core::chapter::decode_text_sample(&sample);
+    assert_eq!(decoded, title);
+    assert!(!decoded.starts_with('\u{0}'), "no stray prefix characters");
+}
+
+#[test]
+fn a_text_track_is_only_chapters_when_a_chap_reference_says_so() {
+    // A QuickTime chapter list *is* a text track, plus a `chap` track reference
+    // from an *enabled* track. Without the reference the text track is subtitles,
+    // lyrics, or captions — and a reader that treats it as chapters puts a
+    // subtitle list in the chapter menu.
+    let moov = container(*b"moov", vec![text_trak(2)]);
+    assert!(
+        !mp4_core::chapter::is_chapter_list(&moov.children[0], &moov),
+        "an unreferenced text track is not a chapter list"
+    );
+
+    // With an enabled audio track referencing it, it is. Note the chapter track
+    // itself is disabled, per Apple.
+    let moov = container(
+        *b"moov",
+        vec![audio_trak_referencing(2, 44_100, 1_000), text_trak(2)],
+    );
+    assert!(
+        mp4_core::chapter::is_chapter_list(&moov.children[1], &moov),
+        "a `chap` reference from an enabled track makes it a chapter list"
+    );
+
+    // A reference naming a track that does not exist: no.
+    let moov = container(
+        *b"moov",
+        vec![audio_trak_referencing(99, 44_100, 1_000), text_trak(2)],
+    );
+    assert!(
+        !mp4_core::chapter::is_chapter_list(&moov.children[1], &moov),
+        "a reference to a different track id does not count"
+    );
+}
+
+#[test]
+fn a_chap_reference_from_a_disabled_track_is_not_honoured() {
+    // The asymmetry that is easy to get backwards: the *referencing* track must be
+    // enabled, not the chapter track. A disabled media track's reference is one a
+    // player ignores.
+    let moov = container(
+        *b"moov",
+        vec![
+            audio_trak_referencing(2, 44_100, 1_000).with_enabled(false),
+            text_trak(2),
+        ],
+    );
+    assert!(
+        !mp4_core::chapter::is_chapter_list(&moov.children[1], &moov),
+        "a disabled track's reference is not honoured"
+    );
+}
+
+#[test]
+fn a_bare_chap_under_udta_also_counts() {
+    // Some muxers put the reference under `udta` rather than inside a `tref`.
+    let udta = container(
+        *b"udta",
+        vec![leaf(*b"chap", 2u32.to_be_bytes().to_vec()).expect("infallible")],
+    );
+    let moov = container(
+        *b"moov",
+        vec![audio_trak(1, 44_100, 1_000), text_trak(2), udta],
+    );
+    assert!(mp4_core::chapter::is_chapter_list(&moov.children[1], &moov));
+}
+
+#[test]
+fn a_track_without_a_tkhd_is_not_a_chapter_list() {
+    // No id, so nothing can reference it.
+    let moov = container(*b"moov", vec![container(*b"trak", vec![])]);
+    assert!(!mp4_core::chapter::is_chapter_list(
+        &moov.children[0],
+        &moov
+    ));
+}
+
+#[test]
+fn a_real_world_chpl_version_zero_parses() {
+    // Real Nero-written M4Bs carry version 0, not the version 1 the Adobe FLV
+    // specification describes. An earlier version of this crate rejected them, so
+    // the chapter list of every real audiobook was silently lost — the file
+    // parsed fine, it just had no chapters, which is the worst kind of bug.
+    let mut payload = vec![0u8, 0, 0, 0]; // version 0, flags 0
+    payload.extend_from_slice(&[0u8; 4]); // reserved
+    payload.extend_from_slice(&1u32.to_be_bytes()); // one chapter
+    payload.extend_from_slice(&0u64.to_be_bytes()); // timestamp
+    payload.push(5);
+    payload.extend_from_slice(b"First");
+
+    let list = ChapterList::parse_chpl(&payload).expect("version 0 is the real-world form");
+    assert_eq!(list.chapters.len(), 1);
+    assert_eq!(list.chapters[0].title, "First");
+}
+
+#[test]
+fn a_chpl_version_one_also_parses() {
+    // What the specification describes, still read for completeness.
+    let list = ChapterList {
+        chapters: vec![Chapter::new(0, "One"), Chapter::new(60_000, "Two")],
+    };
+    let mut payload = list.to_chpl_payload();
+    payload[3] = 1; // claim version 1
+
+    let back = ChapterList::parse_chpl(&payload).expect("version 1 parses");
+    assert_eq!(back.chapters.len(), 2);
+    assert_eq!(back.chapters[1].title, "Two");
+}
+
+#[test]
+fn this_crate_writes_the_version_real_files_carry() {
+    // Writing version 1 because the specification says so would produce output a
+    // version-1-only reader accepts but no real Nero player has been tested
+    // against. Matching the observed world is the safer default.
+    let list = ChapterList {
+        chapters: vec![Chapter::new(0, "One")],
+    };
+    let payload = list.to_chpl_payload();
+    assert_eq!(
+        payload.get(..4),
+        Some(&[0u8, 0, 0, 0][..]),
+        "version 0, which is what real files carry"
+    );
+}
+
+#[test]
+fn a_chpl_version_newer_than_known_is_rejected() {
+    // A future layout is refused rather than misparsed, which is a different
+    // failure from the common version 0 and is worth refusing.
+    // The version is the first *byte*; the next three are flags.
+    let mut payload = vec![2u8, 0, 0, 0]; // version 2
     payload.extend_from_slice(&[0u8; 4]);
     payload.extend_from_slice(&0u32.to_be_bytes());
     assert!(matches!(

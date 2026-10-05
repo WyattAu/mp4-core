@@ -284,6 +284,7 @@ pub fn is_container_type(box_type: &BoxType) -> bool {
             | b"stsd"
             | b"edts"
             | b"dinf"
+            | b"tref"
             | b"udta"
             | b"meta"
             | b"ilst"

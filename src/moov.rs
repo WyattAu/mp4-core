@@ -401,6 +401,12 @@ pub struct Mp4File {
     pub metadata: Metadata,
     /// The parsed chapter list, from `chpl` when present.
     pub chapters: crate::chapter::ChapterList,
+    /// The id of the track carrying a `tref`/`chap` reference.
+    ///
+    /// `None` when the file has no chapter *text track*. This is deliberately not
+    /// "the first text track": an M4B with subtitles has one of those too, and
+    /// treating it as chapters puts a subtitle list in the chapter menu.
+    pub chapter_track_id: Option<u32>,
 }
 
 impl Mp4File {
@@ -443,12 +449,28 @@ impl Mp4File {
 
         let chapters = crate::chapter::ChapterList::find_chpl(data).unwrap_or_default();
 
+        // Resolve the chapter *track* separately from the chapter *list*: the two
+        // chapter mechanisms are independent and files carry one, the other, or
+        // both.
+        let chapter_track_id = moov.and_then(|m| {
+            m.children_of(*b"trak")
+                .into_iter()
+                .find(|t| crate::chapter::is_chapter_list(t, m))
+                .and_then(|t| t.child(*b"tkhd"))
+                .and_then(|tk| {
+                    let ver = tk.payload.first().copied()?;
+                    let off = if ver == 1 { 20 } else { 12 };
+                    u32_at(&tk.payload, off, "tkhd track id").ok()
+                })
+        });
+
         Ok(Self {
             file_type,
             movie,
             tracks,
             metadata,
             chapters,
+            chapter_track_id,
         })
     }
 
@@ -459,9 +481,16 @@ impl Mp4File {
     }
 
     /// The chapter track, when the file uses the text-track form.
+    ///
+    /// Not merely "a text track": a QuickTime chapter list needs a `tref`/`chap`
+    /// track reference from an enabled track, and a file with subtitles, captions,
+    /// or lyrics has a text track that is not one. See
+    /// [`crate::chapter::is_chapter_list`], which this defers to.
     #[must_use]
     pub fn chapter_track(&self) -> Option<&Track> {
-        self.tracks.iter().find(|t| t.handler == HandlerType::Text)
+        self.tracks
+            .iter()
+            .find(|t| Some(t.header.track_id) == self.chapter_track_id)
     }
 
     /// The file's duration in milliseconds, from the movie header.

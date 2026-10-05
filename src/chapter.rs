@@ -106,23 +106,38 @@ impl ChapterList {
 
     /// Parse a `chpl` box payload.
     ///
+    /// # The version byte is 0 in the wild, not 1
+    ///
+    /// The Adobe FLV specification that `chpl` derives from describes version 1,
+    /// but the format is a Nero extension and **real files carry version 0**.
+    /// Inspecting a real 20-hour M4B's chapter box gives:
+    ///
+    /// ```text
+    /// chpl: version: 0, flags: 0, chapters: 54
+    /// ```
+    ///
+    /// An earlier version of this crate rejected anything but 1 and therefore
+    /// silently lost the chapter list of every Nero-written audiobook — the
+    /// failure was invisible because the file parsed fine, just with no chapters.
+    /// Both 0 and 1 are accepted; a higher version is rejected because its layout
+    /// is unknown, not because it is uncommon.
+    ///
     /// # Errors
     ///
     /// [`Mp4Error::MalformedChapters`] when the reserved bytes are wrong, the
     /// entry count does not match the payload, or a title is unterminated.
     pub fn parse_chpl(payload: &[u8]) -> Result<ChapterList, Mp4Error> {
-        // Layout: 4-byte version (must be 1) | 4-byte reserved (must be 0) |
-        // 4-byte entry count | per entry: 8-byte timestamp | 1-byte title
-        // length | title bytes.
+        // Layout: 4-byte version | 4-byte reserved (must be 0) | 4-byte entry
+        // count | per entry: 8-byte timestamp | 1-byte title length | title bytes.
         if payload.len() < 12 {
             return Err(Mp4Error::MalformedChapters {
                 reason: "header is shorter than 12 bytes",
             });
         }
-        let ver = u32_at(payload, 0, "chpl version")?;
-        if ver != 1 {
+        let ver = payload.first().copied().unwrap_or(u8::MAX);
+        if ver > 1 {
             return Err(Mp4Error::MalformedChapters {
-                reason: "unsupported chpl version",
+                reason: "chpl version is newer than the layout this crate knows",
             });
         }
         // Bytes 4..8 are reserved and must be zero.
@@ -164,12 +179,19 @@ impl ChapterList {
 
     /// Serialize to a `chpl` payload.
     ///
+    /// **Emits version 0**, matching what Nero writes and what real files carry,
+    /// even though the Adobe FLV specification the format derives from describes
+    /// version 1. A reader that only accepts version 1 would reject our output,
+    /// and the version-1 population is hypothetical while version 0 is observed.
+    /// Both are accepted on the way in.
+    ///
     /// Titles longer than 255 bytes are truncated, because the format's title
-    /// length is a single byte. This is a format limit, not a policy choice.
+    /// length is a single byte. That is a format limit, not a policy choice, and
+    /// it is the one place this crate silently loses data.
     #[must_use]
     pub fn to_chpl_payload(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(16 + self.chapters.len() * 24);
-        out.extend_from_slice(&1u32.to_be_bytes()); // version 1
+        out.extend_from_slice(&[0u8, 0, 0, 0]); // version 0, flags 0
         out.extend_from_slice(&[0u8; 4]); // reserved
         out.extend_from_slice(&(self.chapters.len() as u32).to_be_bytes());
         for c in &self.chapters {
@@ -222,13 +244,89 @@ impl ChapterList {
     }
 }
 
+/// Whether a track is a chapter list rather than some other text track.
+///
+/// # `tref`/`chap` is what makes the difference
+///
+/// A QuickTime chapter list *is* a text track — one sample per chapter — plus a
+/// track reference of type `chap` **from an enabled track** to it. Apple's
+/// QuickTime File Format documentation is explicit: "It is the 'chap' track
+/// reference that makes the text track into a chapter list."
+///
+/// So an M4B with subtitles, closed captions, or lyrics has a text track that is
+/// not a chapter list. Treating any text track as chapters puts a subtitle list in
+/// a player's chapter menu, which is the visible symptom of this crate's earlier
+/// behaviour.
+///
+/// # Which track's flag matters
+///
+/// The asymmetry is easy to get backwards. The **referencing** track must be
+/// enabled; the chapter track itself "does not need to be enabled, and normally is
+/// not". So the test is not "is this track enabled" but "does some *enabled*
+/// track point at this one's id" — which is why this takes the whole `moov`
+/// rather than just the candidate.
+///
+/// A bare `chap` directly under `udta` is also accepted, because some muxers place
+/// it there instead of inside a `tref`.
+#[must_use]
+pub fn is_chapter_list(track: &Box_, movie: &Box_) -> bool {
+    let Some(id) = track_id(track) else {
+        return false;
+    };
+    if movie
+        .child(*b"udta")
+        .is_some_and(|u| u.child(*b"chap").is_some())
+    {
+        return true;
+    }
+    movie.children_of(*b"trak").iter().any(|other| {
+        // Only an *enabled* track's reference counts.
+        track_enabled(other)
+            && other.child(*b"tref").is_some_and(|t| {
+                t.children_of(*b"chap")
+                    .iter()
+                    .any(|c| reference_id(c) == Some(id))
+            })
+    })
+}
+
+/// A track's id from its `tkhd`, for both header versions.
+fn track_id(track: &Box_) -> Option<u32> {
+    let tkhd = track.child(*b"tkhd")?;
+    let ver = tkhd.payload.first().copied()?;
+    let offset = if ver == 1 { 20 } else { 12 };
+    crate::fields::u32_at(&tkhd.payload, offset, "tkhd track id").ok()
+}
+
+/// Whether a track's `tkhd` has the enabled flag (bit 0 of flags).
+fn track_enabled(track: &Box_) -> bool {
+    track
+        .child(*b"tkhd")
+        .and_then(|t| crate::fields::flags(&t.payload).ok())
+        .is_some_and(|f| f & 1 != 0)
+}
+
+/// The track id a `chap` reference box points at.
+fn reference_id(chap: &Box_) -> Option<u32> {
+    crate::fields::u32_at(&chap.payload, 0, "chap reference").ok()
+}
+
 /// Read chapter names out of a QuickTime text track's samples.
 ///
-/// A chapter track stores each chapter's title as one text sample. This reads
-/// the `stsz` sample sizes and pulls that many bytes per sample out of
-/// `mdat`, which is enough to recover names without decoding the sample table
-/// fully. Returns an empty list when the box chain is absent, which is the
-/// normal case for a file that uses `chpl` instead.
+/// A chapter track stores each chapter's title as one text sample. This reads the
+/// `stsz` sample sizes and pulls that many bytes per sample out of `mdat`, which
+/// is enough to recover names without decoding the sample table fully.
+///
+/// Returns an empty list when the box chain is absent, which is the normal case
+/// for a file that uses `chpl` instead.
+///
+/// # Known limitation
+///
+/// Samples are assumed **contiguous from the first chunk offset**. That holds for
+/// the single-chunk table a chapter track almost always has, but not for one
+/// interleaved with the media track across several chunks. Reading `stsc` to
+/// handle that is the obvious next step, and until then this is documented rather
+/// than hidden — getting it wrong yields garbage titles, not an error.
 ///
 /// # Errors
 ///
@@ -288,9 +386,47 @@ pub fn read_text_track_titles(track: &Box_, mdat: &[u8]) -> Result<Vec<String>, 
     Ok(titles)
 }
 
-/// Decode a QuickTime text sample, honouring a UTF-16 BOM if present.
+/// Decode a QuickTime chapter text sample.
+///
+/// # The two-byte length prefix is not optional
+///
+/// Apple's QuickTime File Format and Technical Note TN2174 both specify the
+/// sample as a 16-bit big-endian length followed by the text, with **no**
+/// terminating null. A chapter title of "Chapter 1" is therefore ten bytes:
+///
+/// ```text
+/// 00 09 43 68 61 70 74 65 72 20 31
+/// ^^^^^ ^-------------------------
+/// len=9   "Chapter 1"
+/// ```
+///
+/// A reader that skips the prefix returns a title starting with two NUL
+/// characters, which every UI renders as `��Chapter 1` — a corruption that is
+/// easy to miss because the name is still recognisable.
+///
+/// The prefix is honoured when it is consistent with the sample, and ignored when
+/// it is not, because some encoders write bare text. Requiring the prefix would
+/// reject those; trusting it blindly would mangle them.
 #[must_use]
 pub fn decode_text_sample(bytes: &[u8]) -> String {
+    // Strip the length prefix when it agrees with what is present. A prefix that
+    // points past the sample is a bare-text sample misread as prefixed, so the
+    // bytes are used as they are.
+    let declared = bytes
+        .get(..2)
+        .and_then(|p| <[u8; 2]>::try_from(p).ok())
+        .map(u16::from_be_bytes);
+    let body = match declared {
+        Some(len) if usize::from(len) <= bytes.len().saturating_sub(2) => {
+            bytes.get(2..2 + usize::from(len)).unwrap_or(&[])
+        }
+        _ => bytes,
+    };
+    decode_text_body(body)
+}
+
+/// Decode the text of a sample, honouring a UTF-16 BOM if present.
+fn decode_text_body(bytes: &[u8]) -> String {
     match (bytes.first(), bytes.get(1)) {
         (Some(0xFF), Some(0xFE)) | (Some(0xFE), Some(0xFF)) => {
             let le = bytes.first().copied().unwrap_or(0) == 0xFF;

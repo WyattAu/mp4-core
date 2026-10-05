@@ -38,7 +38,8 @@ mp4-core = "0.1"
 | `hdlr` | `soun` / `text` / `vide` |
 | iTunes metadata | `udta` → `meta` → `ilst`, `data` type flag modelled explicitly |
 | `stik` | 9 = audiobook |
-| Chapters | Nero `chpl` read + write; QuickTime text-track titles read |
+| Chapters | Nero `chpl` read + write (versions 0 **and** 1); QuickTime text-track titles read |
+| `chap` refs | A text track is a chapter list only when a `tref`/`chap` from an *enabled* track says so |
 
 ## What it deliberately does not do
 
@@ -110,8 +111,11 @@ if let Some(cover) = file.metadata.cover() {
 - **Unknown boxes are preserved**, so a file written by a newer muxer survives a
   read.
 - **`no_std` + `alloc`**, verified on `thumbv7em-none-eabihf`.
-- **Malformed chapters are rejected, not guessed** — a wrong `chpl` version, a
-  non-zero reserved field, or a title running past the box is an error.
+- **A subtitle track is not a chapter track.** Apple's QTFF: "It is the 'chap'
+  track reference that makes the text track into a chapter list." Without that
+  reference the text track is captions, subtitles, or lyrics.
+- **Malformed chapters are rejected, not guessed** — a `chpl` version newer than
+  either known layout, a non-zero reserved field, or a title running past the box.
 
 ## Gates
 
