@@ -235,15 +235,35 @@ pub fn is_ilst_atom(box_type: &BoxType) -> bool {
         )
 }
 
-/// Containers whose payload begins with a full-box header (version + flags).
+/// Bytes of header to skip before descending into a container.
 ///
-/// `meta` is the only one here, and it is the classic trap: its payload is
-/// `version(1) flags(3)` followed by child boxes, so a descent that reads the
-/// first four bytes as a box header sees `size == 0` — the "runs to end of
-/// file" form — and swallows every sibling as one opaque blob.
+/// A "full box" prefixes its payload with `version(1) flags(3)`; some also carry
+/// a count. Getting this wrong is the classic descent bug: reading the first four
+/// bytes as a box header sees `size == 0` — the "runs to end of file" form — and
+/// swallows every sibling as one opaque blob, so the box silently parses as
+/// empty.
+///
+/// | Container | Skipped | Why |
+/// |---|---|---|
+/// | `meta` | 4 | version + flags, then `hdlr`/`ilst` |
+/// | `stsd` | 8 | version + flags + `entry_count`, then sample entries |
+///
+/// `stsd`'s extra four bytes are the reason this is a table and not a flag: a
+/// descent that skips only the version would read the entry count as a box size
+/// and lose every sample entry, which is where the codec's sample rate lives.
+#[must_use]
+pub fn full_box_header_len(box_type: &BoxType) -> usize {
+    match box_type {
+        b"meta" => 4,
+        b"stsd" => 8,
+        _ => 0,
+    }
+}
+
+/// Whether this container's payload is a child box list behind a full-box header.
 #[must_use]
 pub fn full_box_container(box_type: &BoxType) -> bool {
-    box_type == b"meta"
+    full_box_header_len(box_type) != 0
 }
 
 /// Whether this box's payload is a list of child boxes.
@@ -261,6 +281,7 @@ pub fn is_container_type(box_type: &BoxType) -> bool {
             | b"mdia"
             | b"minf"
             | b"stbl"
+            | b"stsd"
             | b"edts"
             | b"dinf"
             | b"udta"
@@ -368,11 +389,13 @@ pub fn parse_boxes(data: &[u8]) -> Result<Vec<Box_>, Mp4Error> {
             .get(body_start..body_start + payload_len)
             .unwrap_or(&[]);
         let children = if is_container_type(&box_type) {
-            // A full-box container's children start after its version+flags.
-            let inner = if full_box_container(&box_type) {
-                payload.get(4..).unwrap_or(&[])
-            } else {
+            // A full-box container's children start after its own header, which
+            // for `stsd` includes the entry count.
+            let skip = full_box_header_len(&box_type);
+            let inner = if skip == 0 {
                 payload
+            } else {
+                payload.get(skip..).unwrap_or(&[])
             };
             parse_boxes(inner)?
         } else {

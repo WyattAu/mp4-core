@@ -384,6 +384,104 @@ fn an_unknown_box_is_preserved_not_rejected() {
 }
 
 #[test]
+fn a_conformant_stsd_entry_yields_the_sample_rate() {
+    // `stsd` is a full box *and* carries an entry count: version(1) flags(3)
+    // entry_count(4) before the entries. A descent that skips only four bytes
+    // reads the entry count as a box size, loses every sample entry, and reports
+    // no sample rate at all — so the header length has to be eight.
+    let entry: Vec<u8> = [
+        vec![0u8; 6],  // reserved
+        vec![0u8, 1],  // data_reference_index
+        vec![0u8; 8],  // version + revision + vendor
+        vec![0u8, 2],  // channel count: stereo
+        vec![0u8, 16], // sample size
+        vec![0u8, 0],  // pre_defined
+        vec![0u8, 0],  // reserved
+        // The spec declares this field as `samplerate << 16`, so 44 100 Hz is
+        // 0xAC44_0000 — an integer part in the high half, not 44 100 itself.
+        (44_100u32 << 16).to_be_bytes().to_vec(),
+    ]
+    .concat();
+    let mp4a = leaf(*b"mp4a", entry.clone()).expect("infallible");
+
+    // The conformant stsd: a full-box header then the entry.
+    let mut stsd_payload = vec![0u8, 0, 0, 0]; // version + flags
+    stsd_payload.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+    stsd_payload.extend_from_slice(&mp4a.to_bytes());
+    // One track, built by hand, so the stsd under test is the only one present.
+    let mut tkhd_payload = vec![0u8, 0, 0, 3];
+    tkhd_payload.extend_from_slice(&0u32.to_be_bytes());
+    tkhd_payload.extend_from_slice(&0u32.to_be_bytes());
+    tkhd_payload.extend_from_slice(&1u32.to_be_bytes());
+    tkhd_payload.extend_from_slice(&0u32.to_be_bytes());
+    tkhd_payload.extend_from_slice(&1_000u32.to_be_bytes());
+    tkhd_payload.extend_from_slice(&[0u8; 8]);
+    let tkhd = leaf(*b"tkhd", tkhd_payload).expect("infallible");
+    let mdhd = leaf(
+        *b"mdhd",
+        mp4_core::moov::MediaHeader::to_payload(44_100, 1_000),
+    )
+    .expect("infallible");
+    let mut hdlr_payload = vec![0u8, 0, 0, 0];
+    hdlr_payload.extend_from_slice(&[0u8, 0, 0, 0]);
+    hdlr_payload.extend_from_slice(b"soun");
+    hdlr_payload.extend_from_slice(&[0u8; 12]);
+    let hdlr = leaf(*b"hdlr", hdlr_payload).expect("infallible");
+
+    let stbl = container(
+        *b"stbl",
+        vec![leaf(*b"stsd", stsd_payload).expect("infallible")],
+    );
+    let minf = container(*b"minf", vec![stbl]);
+    let mdia = container(*b"mdia", vec![mdhd, hdlr, minf]);
+    let trak = container(*b"trak", vec![tkhd, mdia]);
+    let moov = container(
+        *b"moov",
+        vec![
+            leaf(*b"mvhd", MovieHeader::to_payload(1_000, 1_000)).expect("infallible"),
+            trak,
+        ],
+    );
+
+    let mut data = leaf(*b"ftyp", FileType::audiobook().to_payload())
+        .expect("infallible")
+        .to_bytes();
+    data.extend_from_slice(&moov.to_bytes());
+
+    // The entry is reachable at all.
+    let boxes = parse_boxes(&data).expect("parses");
+    let moov_b = boxes.iter().find(|b| b.box_type == *b"moov").expect("moov");
+    let stsd = moov_b
+        .children_of(*b"trak")
+        .into_iter()
+        .flat_map(|t| t.children_of(*b"mdia"))
+        .flat_map(|m| m.children_of(*b"minf"))
+        .filter_map(|m| m.child(*b"stbl"))
+        .filter_map(|s| s.child(*b"stsd"))
+        .next()
+        .expect("an stsd");
+    assert_eq!(
+        stsd.children.len(),
+        1,
+        "the entry count must not be read as a box size"
+    );
+    assert_eq!(stsd.children[0].payload, entry);
+
+    // And the rate reads back through the public accessor.
+    assert_eq!(
+        mp4_core::moov::read_sample_rate(&data),
+        Some(44_100),
+        "the integer part of the 16.16 word, not the whole word read as a fraction"
+    );
+
+    // Storing the rate unshifted is the mistake a hand-written muxer makes, and it
+    // must read as "no rate" rather than as 44 100 by accident.
+    let mut wrong = entry.clone();
+    wrong[24..28].copy_from_slice(&44_100u32.to_be_bytes());
+    assert_eq!(mp4_core::fields::audio_sample_rate(44_100), 0);
+}
+
+#[test]
 fn a_chpl_box_with_a_wrong_version_is_rejected() {
     let mut payload = vec![0u8, 0, 0, 2]; // version 2, not 1
     payload.extend_from_slice(&[0u8; 4]);

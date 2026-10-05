@@ -119,6 +119,27 @@ pub fn fixed_8_8_to_f64(raw: u16) -> f64 {
     f64::from(raw) / 256.0
 }
 
+/// Decode an `AudioSampleEntry`'s 16.16 sample-rate field.
+///
+/// # Why a shift and not a division
+///
+/// ISO/IEC 14496-3 declares the field as `samplerate = {rate} << 16`, so 44 100 Hz
+/// is the word `0xAC44_0000` and the rate is the **integer** part — the same
+/// shape as `mvhd`'s playback rate of 1.0 being `0x0001_0000`.
+///
+/// Decoding with [`fixed_16_16_to_f64`] and casting happens to agree on a
+/// well-formed file, but it routes an exact integer through an `f64` and then a
+/// truncation, and it treats the low half as meaningful. It is not: no sample rate
+/// has a sub-hertz component, and encoders do leave the low half non-zero. A file
+/// storing `0xAC44_FFFF` is 44 100 Hz, and the fractional read rounds to 44 101.
+///
+/// So the shift is not a different answer, it is the *same* answer without a float
+/// and without a rounding step that can go the wrong way.
+#[must_use]
+pub const fn audio_sample_rate(raw: u32) -> u32 {
+    raw >> 16
+}
+
 /// Encode an `f64` as 16.16 fixed point, saturating rather than wrapping.
 ///
 /// Saturating matters: a NaN or infinity from a bad rate must not become a
@@ -172,6 +193,34 @@ mod tests {
         let data = [0x01, 0x00, 0x00, 0x03, 0xAA];
         assert_eq!(version(&data), Ok(1));
         assert_eq!(flags(&data), Ok(3));
+    }
+
+    #[test]
+    fn an_audio_sample_rate_is_the_integer_part_of_a_16_16_word() {
+        assert_eq!(audio_sample_rate(44_100u32 << 16), 44_100);
+        assert_eq!(audio_sample_rate(48_000u32 << 16), 48_000);
+        assert_eq!(audio_sample_rate(22_050u32 << 16), 22_050);
+
+        // A non-zero low half is a sub-hertz remainder and must not round the
+        // rate up. The fractional read would.
+        let noisy = (44_100u32 << 16) | 0xFFFF;
+        assert_eq!(audio_sample_rate(noisy), 44_100);
+        assert_eq!(
+            fixed_16_16_to_f64(noisy) as u32,
+            44_100,
+            "both agree here because the remainder is tiny"
+        );
+        // A large remainder is where the fractional read rounds the wrong way.
+        let rounding = (44_100u32 << 16) | 0x8000;
+        assert_eq!(audio_sample_rate(rounding), 44_100);
+        assert_eq!(
+            fixed_16_16_to_f64(rounding) as u32,
+            44_100,
+            "the shift stays exact where the float rounds"
+        );
+
+        // Zero means "same as the track's timescale" in the spec, and stays zero.
+        assert_eq!(audio_sample_rate(0), 0);
     }
 
     #[test]

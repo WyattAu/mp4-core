@@ -33,7 +33,8 @@ use alloc::vec::Vec;
 use crate::container::{parse_boxes, Box_};
 use crate::error::Mp4Error;
 use crate::fields::{
-    f64_to_fixed_16_16, fixed_16_16_to_f64, push_u16, push_u32, u32_at, u64_at, version,
+    audio_sample_rate, f64_to_fixed_16_16, fixed_16_16_to_f64, push_u16, push_u32, u32_at, u64_at,
+    version,
 };
 use crate::metadata::Metadata;
 
@@ -492,11 +493,19 @@ impl Mp4File {
     }
 }
 
-/// Read the sample rate from the first `mp4a` sample entry in a file.
+/// Read the sample rate from the first audio sample entry in a file.
 ///
-/// The rate lives at a fixed offset in the sample entry as 16.16 fixed point. A
-/// stored 0 means "same as the track's timescale", which is the spec's
-/// convention rather than a zero-rate track, so it yields `None`.
+/// The rate sits at a fixed offset in the `AudioSampleEntry` — 6 reserved +
+/// 2 `data_reference_index` + 8 reserved + 2 channels + 2 sample size +
+/// 2 pre-defined + 2 reserved, then the 4-byte rate. That word is an integer in
+/// its **high** half, not a 16.16 fraction; see
+/// [`crate::fields::audio_sample_rate`] for why reading it as a fraction yields
+/// 0 for every real file. A stored 0 means "same as the track's timescale", the
+/// spec's convention rather than a zero-rate track, so it yields `None`.
+///
+/// Reaching it needs the `stsd` full-box header to have been handled: a reader
+/// that skipped only `version`+`flags` would mistake the entry count for a box
+/// size and find no entries at all.
 #[must_use]
 pub fn read_sample_rate(data: &[u8]) -> Option<u32> {
     let boxes = parse_boxes(data).ok()?;
@@ -517,10 +526,12 @@ pub fn read_sample_rate(data: &[u8]) -> Option<u32> {
             continue;
         }
         let raw = u32_at(&entry.payload, 24, "sample rate").ok()?;
-        if raw == 0 {
+        let rate = audio_sample_rate(raw);
+        if rate == 0 {
+            // The spec's "same as the track's timescale" convention.
             continue;
         }
-        return Some(fixed_16_16_to_f64(raw) as u32);
+        return Some(rate);
     }
     None
 }
