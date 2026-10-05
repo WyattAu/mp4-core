@@ -3,6 +3,62 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+## [0.3.0] - 2026-10-05
+
+The QuickTime chapter track is now read, which closes the gap the conformance harness
+named as its own blind spot. ffmpeg writes one on **every** M4B it produces, so this
+is the mechanism most real chapter tracks use.
+
+### Added
+
+- **`sample`** — a sample-table reader. Recovering a chapter track's titles *and* times
+  needs four boxes, and each answers a question no other one can: `stts` for when each
+  sample appears (`DT(i) = Σ delta(j)` over `j < i`, in the track's own timescale),
+  `stsz` for how long each sample is, `stco`/`co64` for where each **chunk** starts, and
+  `stsc` for how many samples are in each chunk.
+- **`chapter::read_text_track_chapters`** — titles and start times from a chapter
+  track. Each sample's *display time* is its chapter's start, per Apple's wording.
+- **`Mp4File::effective_chapters`** — the list a player would show, preferring the
+  chapter track over `chpl`. Not an arbitrary preference: **QuickTime, iTunes and the
+  built-in iOS audiobook player read the track and ignore Nero chapters entirely**, so
+  preferring `chpl` would mean preferring the mechanism those players discard.
+- **`Mp4File::chapter_disagreement`** — `Some` when a file carries both mechanisms and
+  they differ. A muxer can write each from a different source; a library that silently
+  prefers one shows the user a list the file contradicts, and neither list is *wrong* on
+  its own, so a plain chapter comparison would pass.
+
+### Why `stsc` matters even though the common case would work without it
+
+`stco` gives **chunk** offsets, not sample offsets. Treating the first chunk offset as
+the first sample offset and adding sizes in sequence is correct only when every chunk
+holds the same number of samples and there is exactly one chunk — true of a one-chunk
+chapter track, false of almost everything else. Worse, the failure is silent: a wrong
+offset yields bytes that look like text, so a reader reports *garbage titles* rather
+than an error.
+
+`co64` is likewise not exotic. It is the 64-bit form of `stco`, needed past 4 GB — a
+9-hour CD-quality audiobook, well inside the range real libraries hold — so a reader
+knowing only `stco` silently reads wrong bytes on exactly the largest files.
+
+### Robustness
+
+- A `stsz` whose declared count exceeds the bytes present yields the sizes that *are*
+  there, with `SampleTable::is_complete` reporting the shortfall. Erroring would lose
+  a whole chapter list over one wrong field.
+- A corrupt count cannot become an allocation; every table read is bounded by
+  `MAX_TABLE_ENTRIES`.
+- An incomplete table stops rather than reading past what it can place.
+
+### Changed
+
+- **`Mp4File::chapters` is now `chpl_chapters`**, with `chapter_track_chapters` beside
+  it and `effective_chapters` as the accessor. The old name suggested one list where
+  there are two independent mechanisms.
+- **Chapters are reported in file order, not time order.** Sorting silently would hide
+  a producer that wrote its chapters backwards, and the old `chapters` accessor did
+  exactly that — so a defect no consumer could see. `audiobook-core`'s `Title::validate`
+  reports it instead.
+
 ## [0.2.1] - 2026-10-05
 
 The `chpl` reader was built from the Adobe FLV specification and could not read a

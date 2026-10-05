@@ -70,6 +70,7 @@ pub mod error;
 pub mod fields;
 pub mod metadata;
 pub mod moov;
+pub mod sample;
 
 pub use chapter::{Chapter, ChapterList, MAX_CHPL_CHAPTERS, MAX_CHPL_TITLE_BYTES};
 pub use container::{parse_boxes, BoxType, Box_, Size, SizeForm};
@@ -79,3 +80,4 @@ pub use moov::{
     duration_ms, read_ftyp, read_mvhd, read_tracks, FileType, HandlerType, MediaHeader,
     MovieHeader, Mp4File, Track, TrackHeader,
 };
+pub use sample::{read_sample_table, SampleTable};

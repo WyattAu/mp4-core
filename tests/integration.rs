@@ -293,9 +293,9 @@ fn a_file_with_metadata_and_chapters_round_trips() {
     assert_eq!(file.metadata.track_number(), Some(3));
     assert_eq!(file.metadata.track_total(), Some(12));
 
-    assert_eq!(file.chapters.chapters.len(), 3);
-    assert_eq!(file.chapters.chapters[1].title, "Chapter One");
-    assert_eq!(file.chapters.chapters[1].start_ms, 900_000);
+    assert_eq!(file.effective_chapters().chapters.len(), 3);
+    assert_eq!(file.effective_chapters().chapters[1].title, "Chapter One");
+    assert_eq!(file.effective_chapters().chapters[1].start_ms, 900_000);
     assert!(file.is_audiobook());
 }
 
@@ -362,13 +362,13 @@ fn the_two_chapter_mechanisms_are_independent() {
     // have both". So neither mechanism may be inferred from the other's presence.
     let with_chpl_only = file_with_chpl(&[("A", 0u64), ("B", 1_000)]);
     let file = Mp4File::parse(&with_chpl_only).expect("parses");
-    assert_eq!(file.chapters.chapters.len(), 2);
+    assert_eq!(file.effective_chapters().chapters.len(), 2);
     assert_eq!(file.chapter_track_id, None, "no text track at all");
     assert!(file.is_audiobook(), "`chpl` alone is enough");
 
     let neither = file_with_chpl(&[]);
     let file = Mp4File::parse(&neither).expect("parses");
-    assert!(file.chapters.chapters.is_empty());
+    assert!(file.effective_chapters().chapters.is_empty());
     assert_eq!(file.chapter_track_id, None);
     // Still an audiobook by brand alone — which is why `is_audiobook` ORs its
     // signals rather than chaining them. A file can carry `M4B ` with no chapters,
@@ -605,6 +605,304 @@ fn a_conformant_stsd_entry_yields_the_sample_rate() {
     let mut wrong = entry.clone();
     wrong[24..28].copy_from_slice(&44_100u32.to_be_bytes());
     assert_eq!(mp4_core::fields::audio_sample_rate(44_100), 0);
+}
+
+/// The chapter-track sample tables exactly as ffmpeg writes them, captured from a
+/// real `book.m4b`.
+///
+/// One chunk at file offset 44 (the first byte of `mdat`), three samples of 25, 25 and
+/// 27 bytes, and one `stts` entry declaring all three as 2 646 000 ticks at a
+/// 44 100 Hz timescale — 60 s each.
+fn ffmpeg_chapter_stbl() -> mp4_core::Box_ {
+    let mut stts = vec![0u8, 0, 0, 0];
+    stts.extend_from_slice(&1u32.to_be_bytes()); // entry count
+    stts.extend_from_slice(&3u32.to_be_bytes()); // covering 3 samples
+    stts.extend_from_slice(&2_646_000u32.to_be_bytes()); // 60 s at 44.1 kHz
+
+    let mut stsz = vec![0u8, 0, 0, 0];
+    stsz.extend_from_slice(&0u32.to_be_bytes()); // not uniform
+    stsz.extend_from_slice(&3u32.to_be_bytes());
+    stsz.extend_from_slice(&25u32.to_be_bytes());
+    stsz.extend_from_slice(&25u32.to_be_bytes());
+    stsz.extend_from_slice(&27u32.to_be_bytes());
+
+    let mut stsc = vec![0u8, 0, 0, 0];
+    stsc.extend_from_slice(&1u32.to_be_bytes());
+    stsc.extend_from_slice(&1u32.to_be_bytes()); // first chunk
+    stsc.extend_from_slice(&3u32.to_be_bytes()); // samples per chunk
+    stsc.extend_from_slice(&1u32.to_be_bytes()); // description index
+
+    let mut stco = vec![0u8, 0, 0, 0];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&44u32.to_be_bytes()); // the first byte of mdat
+
+    container(
+        *b"stbl",
+        vec![
+            leaf(*b"stts", stts).expect("infallible"),
+            leaf(*b"stsz", stsz).expect("infallible"),
+            leaf(*b"stsc", stsc).expect("infallible"),
+            leaf(*b"stco", stco).expect("infallible"),
+        ],
+    )
+}
+
+/// A `text` track carrying that sample table, with the 44.1 kHz timescale ffmpeg uses.
+fn ffmpeg_chapter_trak() -> mp4_core::Box_ {
+    let mut tkhd_payload = vec![0u8, 0, 0, 0]; // flags 0: a chapter track is disabled
+    tkhd_payload.extend_from_slice(&0u32.to_be_bytes());
+    tkhd_payload.extend_from_slice(&0u32.to_be_bytes());
+    tkhd_payload.extend_from_slice(&2u32.to_be_bytes()); // track id 2
+    tkhd_payload.extend_from_slice(&0u32.to_be_bytes());
+    tkhd_payload.extend_from_slice(&7_935_952u32.to_be_bytes()); // duration
+    tkhd_payload.extend_from_slice(&[0u8; 8]);
+    let tkhd = leaf(*b"tkhd", tkhd_payload).expect("infallible");
+
+    let mdhd = leaf(
+        *b"mdhd",
+        mp4_core::moov::MediaHeader::to_payload(44_100, 180_000),
+    )
+    .expect("infallible");
+
+    let mut hdlr = vec![0u8, 0, 0, 0];
+    hdlr.extend_from_slice(&[0u8, 0, 0, 0]);
+    hdlr.extend_from_slice(b"text");
+    hdlr.extend_from_slice(&[0u8; 12]);
+    let hdlr = leaf(*b"hdlr", hdlr).expect("infallible");
+
+    // `gmhd`, which is what a QuickTime text track uses. TN2174's chapter marker track
+    // uses `nmhd`; both are accepted because the handler type is what distinguishes
+    // the track and nothing else depends on the difference.
+    let gmhd = leaf(
+        *b"gmhd",
+        [
+            vec![0u8, 0, 0, 0],
+            vec![0u8, 0, 0, 0],
+            vec![0u8, 0, 0, 0, 0, 0, 0, 0x12, 0, 0, 0, 0],
+        ]
+        .concat(),
+    )
+    .expect("infallible");
+    let stsd = {
+        let mut p = vec![0u8, 0, 0, 0];
+        p.extend_from_slice(&1u32.to_be_bytes());
+        p.extend_from_slice(&[0u8; 6]); // reserved
+        p.extend_from_slice(&[0u8, 1]); // data reference index
+        p.extend_from_slice(&[0u8; 6]); // display flags, justification, bg colour
+        p.extend_from_slice(&[0u8; 6]); // box, border, style
+        p.extend_from_slice(&[0u8; 8]); // font number, font face, reserved
+        p.extend_from_slice(&[0u8; 1]); // foreground colour count
+        p.extend_from_slice(&[0u8; 3]); // foreground colour
+        let entry = leaf(*b"text", p).expect("infallible");
+        leaf(*b"stsd", {
+            let mut q = vec![0u8, 0, 0, 0];
+            q.extend_from_slice(&1u32.to_be_bytes());
+            q.extend_from_slice(&entry.to_bytes());
+            q
+        })
+        .expect("infallible")
+    };
+
+    let minf = container(*b"minf", vec![gmhd, stsd, ffmpeg_chapter_stbl()]);
+    let mdia = container(*b"mdia", vec![mdhd, hdlr, minf]);
+    container(*b"trak", vec![tkhd, mdia])
+}
+
+/// One QuickTime text sample: a 2-byte length prefix, the text with no null
+/// terminator, then a trailing modifier box.
+///
+/// The modifier is not decoration — it is what makes the real samples 25, 25 and 27
+/// bytes rather than 13, 13 and 15, and `stsz` records those larger sizes. A decoder
+/// that appended everything after the prefix would return
+/// `"Chapter One\u{0}\u{0}\u{0}\u{c}encd..."`, so its presence here is the test.
+fn qt_text_sample(title: &str) -> Vec<u8> {
+    let mut out = (title.len() as u16).to_be_bytes().to_vec();
+    out.extend_from_slice(title.as_bytes());
+    // A 12-byte `encd` modifier box: 4-byte size, 4-byte type, 4-byte payload.
+    out.extend_from_slice(&12u32.to_be_bytes());
+    out.extend_from_slice(b"encd");
+    out.extend_from_slice(&[0u8; 4]);
+    out
+}
+
+/// The three chapter samples ffmpeg writes, at the sizes `stsz` declares.
+fn ffmpeg_chapter_samples() -> Vec<u8> {
+    let mut out = Vec::new();
+    for title in ["Chapter One", "Chapter Two", "Chapter Three"] {
+        out.extend_from_slice(&qt_text_sample(title));
+    }
+    out
+}
+
+/// A file laid out like a real one: `ftyp`, a `free` box, then the sample data at
+/// offset 44, with `moov` last.
+///
+/// The chapter track's `stco` says offset 44, so the samples must genuinely *be* at
+/// 44 in whatever file the track is embedded in — hence assembling the whole file
+/// rather than appending a `trak` to a buffer that already had headers in front of it.
+fn ffmpeg_assembled(children: &[mp4_core::Box_]) -> Vec<u8> {
+    use std::vec::Vec as StdVec;
+    let mut file = leaf(*b"ftyp", mp4_core::FileType::audiobook().to_payload())
+        .expect("infallible")
+        .to_bytes();
+    // A bare 8-byte `free` box, then an `mdat` whose header spans 36..44 so that its
+    // payload — the chapter samples — starts at exactly 44. This is the real layout:
+    // writing the samples bare would make the top-level box walker read their length
+    // prefix as a box size, which is a fixture bug that looks exactly like a parser bug.
+    file.extend_from_slice(&8u32.to_be_bytes());
+    file.extend_from_slice(b"free");
+    assert_eq!(file.len(), 36, "the mdat header must span 36..44");
+
+    let samples = ffmpeg_chapter_samples();
+    file.extend_from_slice(&((samples.len() + 8) as u32).to_be_bytes());
+    file.extend_from_slice(b"mdat");
+    assert_eq!(file.len(), 44, "the sample data must start where stco says");
+    file.extend_from_slice(&samples);
+
+    let mut moov_children: StdVec<mp4_core::Box_> =
+        vec![leaf(*b"mvhd", MovieHeader::to_payload(1_000, 180_000)).expect("infallible")];
+    moov_children.extend_from_slice(children);
+    file.extend_from_slice(&container(*b"moov", moov_children).to_bytes());
+    file
+}
+
+/// Just the sample data at offset 44, for the tests that call the reader directly.
+fn ffmpeg_chapter_file() -> Vec<u8> {
+    let mut file = vec![0u8; 44];
+    file.extend_from_slice(&ffmpeg_chapter_samples());
+    file
+}
+
+#[test]
+fn a_quicktime_chapter_track_reads_titles_and_times() {
+    // The whole point: a chapter track's titles need four boxes to recover — `stts` for
+    // when each sample appears, `stsz` for how long it is, and `stco` with `stsc` for
+    // where it lives. A reader that confuses chunk offsets with sample offsets reads
+    // *garbage* rather than failing, which is why `stsc` is consulted at all.
+    let trak = ffmpeg_chapter_trak();
+    let file = ffmpeg_chapter_file();
+    let list = mp4_core::chapter::read_text_track_chapters(&trak, &file).expect("reads");
+
+    assert_eq!(list.chapters.len(), 3);
+    assert_eq!(list.chapters[0].start_ms, 0);
+    assert_eq!(list.chapters[0].title, "Chapter One");
+    assert_eq!(list.chapters[1].start_ms, 60_000, "from stts, not a guess");
+    assert_eq!(list.chapters[1].title, "Chapter Two");
+    assert_eq!(list.chapters[2].start_ms, 120_000);
+    assert_eq!(list.chapters[2].title, "Chapter Three");
+}
+
+#[test]
+fn the_length_prefix_does_not_reach_the_title() {
+    // Without stripping it, every title begins with two NULs.
+    let trak = ffmpeg_chapter_trak();
+    let file = ffmpeg_chapter_file();
+    for chapter in mp4_core::chapter::read_text_track_chapters(&trak, &file)
+        .expect("reads")
+        .chapters
+    {
+        assert!(
+            !chapter.title.starts_with('\u{0}'),
+            "`{}` carries the length prefix",
+            chapter.title
+        );
+    }
+}
+
+#[test]
+fn titles_only_needs_the_same_boxes() {
+    let trak = ffmpeg_chapter_trak();
+    let file = ffmpeg_chapter_file();
+    let titles = mp4_core::chapter::read_text_track_titles(&trak, &file).expect("reads");
+    assert_eq!(titles, vec!["Chapter One", "Chapter Two", "Chapter Three"]);
+}
+
+#[test]
+fn a_missing_sample_table_is_an_error_rather_than_no_chapters() {
+    // "Absent" and "present but unreadable" are different problems, and a caller has
+    // to be able to tell them apart.
+    let mdia = container(*b"mdia", vec![]);
+    let trak = container(*b"trak", vec![container(*b"mdia", vec![])]);
+    let _ = mdia;
+    assert!(matches!(
+        mp4_core::chapter::read_text_track_chapters(&trak, &[0u8; 64]),
+        Err(mp4_core::Mp4Error::MissingBox { .. })
+    ));
+}
+
+#[test]
+fn a_sample_pointing_outside_the_file_is_an_error() {
+    let trak = ffmpeg_chapter_trak();
+    // A file too short to hold the samples.
+    let short = vec![0u8; 50];
+    assert!(matches!(
+        mp4_core::chapter::read_text_track_chapters(&trak, &short),
+        Err(mp4_core::Mp4Error::TruncatedBox { .. })
+    ));
+}
+
+#[test]
+fn the_track_is_preferred_over_chpl_because_apple_players_ignore_chpl() {
+    // QuickTime, iTunes and the built-in iOS audiobook player read the chapter track and
+    // ignore Nero chapters entirely. So when a file carries both, the track is the list
+    // a player shows.
+    let data = ffmpeg_assembled(&[
+        audio_trak_referencing(2, 44_100, 180_000),
+        ffmpeg_chapter_trak(),
+        // A `chpl` that deliberately disagrees, to prove the preference is real.
+        mp4_core::ChapterList {
+            chapters: vec![mp4_core::Chapter::new(0, "Nero Only")],
+        }
+        .to_chpl_box(),
+    ]);
+
+    let file = Mp4File::parse(&data).expect("parses");
+    assert_eq!(file.chapter_track_id, Some(2));
+    assert_eq!(file.chpl_chapters.chapters.len(), 1);
+    assert_eq!(
+        file.effective_chapters().chapters[0].title,
+        "Chapter One",
+        "the track wins"
+    );
+    assert!(
+        file.chapter_disagreement().is_some(),
+        "and the disagreement is reportable rather than hidden"
+    );
+}
+
+#[test]
+fn agreeing_mechanisms_report_no_disagreement() {
+    let data = ffmpeg_assembled(&[
+        audio_trak_referencing(2, 44_100, 180_000),
+        ffmpeg_chapter_trak(),
+        mp4_core::ChapterList {
+            chapters: vec![
+                mp4_core::Chapter::new(0, "Chapter One"),
+                mp4_core::Chapter::new(60_000, "Chapter Two"),
+                mp4_core::Chapter::new(120_000, "Chapter Three"),
+            ],
+        }
+        .to_chpl_box(),
+    ]);
+
+    let file = Mp4File::parse(&data).expect("parses");
+    assert_eq!(file.chapter_track_chapters.chapters.len(), 3);
+    assert!(
+        file.chapter_disagreement().is_none(),
+        "both mechanisms carrying the same list is not a finding"
+    );
+}
+
+#[test]
+fn with_only_chpl_the_effective_list_falls_back_to_it() {
+    let data = file_with_chpl(&[("One", 0u64), ("Two", 60_000)]);
+    let file = Mp4File::parse(&data).expect("parses");
+    assert_eq!(file.chapter_track_id, None);
+    assert_eq!(file.effective_chapters().chapters.len(), 2);
+    assert!(
+        file.chapter_disagreement().is_none(),
+        "nothing to disagree about"
+    );
 }
 
 #[test]

@@ -26,7 +26,6 @@ use alloc::vec::Vec;
 
 use crate::container::{leaf, Box_};
 use crate::error::Mp4Error;
-use crate::fields::{u32_at, u64_at};
 
 /// Nanoseconds per `chpl` tick.
 pub const CHPL_TICKS_PER_SECOND: u64 = 10_000_000;
@@ -403,79 +402,69 @@ fn reference_id(chap: &Box_) -> Option<u32> {
     crate::fields::u32_at(&chap.payload, 0, "chap reference").ok()
 }
 
-/// Read chapter names out of a QuickTime text track's samples.
+/// Read a QuickTime chapter track's chapters, with titles and start times.
 ///
-/// A chapter track stores each chapter's title as one text sample. This reads the
-/// `stsz` sample sizes and pulls that many bytes per sample out of `mdat`, which
-/// is enough to recover names without decoding the sample table fully.
+/// Each sample's **display time** is the chapter's start — Apple's wording is
+/// "the display time for each sample corresponds to the point in the movie that marks
+/// the beginning of that chapter" — so the times come from `stts` accumulated through
+/// the track's own timescale, and the titles from the samples' bytes.
 ///
-/// Returns an empty list when the box chain is absent, which is the normal case
-/// for a file that uses `chpl` instead.
-///
-/// # Known limitation
-///
-/// Samples are assumed **contiguous from the first chunk offset**. That holds for
-/// the single-chunk table a chapter track almost always has, but not for one
-/// interleaved with the media track across several chunks. Reading `stsc` to
-/// handle that is the obvious next step, and until then this is documented rather
-/// than hidden — getting it wrong yields garbage titles, not an error.
+/// Returns an empty list when the box chain is absent, which is the normal case for a
+/// file that uses `chpl` instead. A caller that wants to tell "absent" from "present
+/// but unreadable" should check
+/// [`crate::Mp4File::chapter_track_id`] first, because this returns `Ok` either way.
 ///
 /// # Errors
 ///
-/// [`Mp4Error::MissingBox`] when a required box is absent, and
-/// [`Mp4Error::TruncatedBox`] when the samples do not fit the `mdat`.
-pub fn read_text_track_titles(track: &Box_, mdat: &[u8]) -> Result<Vec<String>, Mp4Error> {
+/// [`Mp4Error::MissingBox`] when the sample table is absent, and
+/// [`Mp4Error::TruncatedBox`] when a sample lies outside `file`.
+pub fn read_text_track_chapters(track: &Box_, file: &[u8]) -> Result<ChapterList, Mp4Error> {
     let stbl = track
         .child(*b"mdia")
         .and_then(|m| m.child(*b"minf"))
         .and_then(|m| m.child(*b"stbl"))
         .ok_or(Mp4Error::MissingBox { box_type: *b"stbl" })?;
+    let table = crate::sample::read_sample_table(stbl)?;
 
-    let stsz = stbl
-        .child(*b"stsz")
-        .ok_or(Mp4Error::MissingBox { box_type: *b"stsz" })?;
-    let stco = stbl.child(*b"stco").or_else(|| stbl.child(*b"co64"));
+    // The timescale governs every time in this track. Reading it from `mvhd` instead
+    // is the classic mistake, and the two need not match.
+    let timescale = track
+        .child(*b"mdia")
+        .and_then(|m| m.child(*b"mdhd"))
+        .and_then(|b| crate::moov::MediaHeader::parse(&b.payload).ok())
+        .map_or(0, |m| m.timescale);
 
-    let sizes = stsz.payload.as_slice();
-    // Layout: version+flags (4) | sample_size (4) | sample_count (4) | sizes.
-    let uniform = u32_at(sizes, 4, "stsz sample size")?;
-    let count = u32_at(sizes, 8, "stsz sample count")?;
-    let mut per_sample: Vec<u32> = Vec::new();
-    if uniform == 0 {
-        for i in 0..count {
-            let off = 12 + (i as usize) * 4;
-            per_sample.push(u32_at(sizes, off, "stsz entry")?);
-        }
+    let mut chapters = Vec::with_capacity(table.sample_count as usize);
+    for i in 0..table.sample_count as usize {
+        // An incomplete table cannot place the sample. Stopping is much better than
+        // reading a plausible-looking offset: a wrong offset yields bytes that look
+        // like text, so the failure would be garbage titles rather than an error.
+        let (Some(offset), Some(size)) = (table.offsets.get(i), table.sizes.get(i)) else {
+            break;
+        };
+        let bytes = table.sample_bytes(i, file).ok_or(Mp4Error::TruncatedBox {
+            box_type: *b"mdat",
+            declared: offset.saturating_add(u64::from(*size)),
+            available: file.len(),
+        })?;
+        chapters.push(Chapter {
+            start_ms: table.start_time(i, timescale).unwrap_or(0),
+            title: decode_text_sample(bytes),
+        });
     }
+    Ok(ChapterList { chapters })
+}
 
-    // Chunk offsets: the first offset is where the track's data begins.
-    let base = match stco {
-        Some(c) => {
-            let p = c.payload.as_slice();
-            if c.box_type == *b"co64" {
-                u64_at(p, 8, "co64 first offset")? as usize
-            } else {
-                u32_at(p, 8, "stco first offset")? as usize
-            }
-        }
-        None => 0,
-    };
-
-    let mut titles = Vec::new();
-    let mut cursor = base;
-    for size in per_sample {
-        let bytes = mdat
-            .get(cursor..cursor + size as usize)
-            .ok_or(Mp4Error::TruncatedBox {
-                box_type: *b"mdat",
-                declared: cursor as u64 + u64::from(size),
-                available: mdat.len(),
-            })?;
-        // QuickTime text samples are usually UTF-8, sometimes UTF-16 with a BOM.
-        titles.push(decode_text_sample(bytes));
-        cursor += size as usize;
-    }
-    Ok(titles)
+/// Read just the titles of a QuickTime chapter track, without their times.
+///
+/// Kept because a caller sometimes has its own timing — a sidecar file, say — and only
+/// wants the names. Prefer [`read_text_track_chapters`] when times are wanted.
+pub fn read_text_track_titles(track: &Box_, file: &[u8]) -> Result<Vec<String>, Mp4Error> {
+    Ok(read_text_track_chapters(track, file)?
+        .chapters
+        .into_iter()
+        .map(|c| c.title)
+        .collect())
 }
 
 /// Decode a QuickTime chapter text sample.

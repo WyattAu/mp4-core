@@ -399,8 +399,14 @@ pub struct Mp4File {
     pub tracks: Vec<Track>,
     /// The metadata from `moov` → `udta` → `meta` → `ilst`.
     pub metadata: Metadata,
-    /// The parsed chapter list, from `chpl` when present.
-    pub chapters: crate::chapter::ChapterList,
+    /// The chapters from the Nero `chpl` box.
+    ///
+    /// Empty when the file has no `chpl`, which is common: Apple writes the
+    /// QuickTime form instead. Read [`Mp4File::effective_chapters`] for the list a
+    /// player would show.
+    pub chpl_chapters: crate::chapter::ChapterList,
+    /// The chapters from the QuickTime chapter track, when the file has one.
+    pub chapter_track_chapters: crate::chapter::ChapterList,
     /// The id of the track carrying a `tref`/`chap` reference.
     ///
     /// `None` when the file has no chapter *text track*. This is deliberately not
@@ -447,7 +453,7 @@ impl Mp4File {
             .and_then(crate::metadata::parse_meta)
             .unwrap_or_default();
 
-        let chapters = crate::chapter::ChapterList::find_chpl(data).unwrap_or_default();
+        let chpl_chapters = crate::chapter::ChapterList::find_chpl(data).unwrap_or_default();
 
         // Resolve the chapter *track* separately from the chapter *list*: the two
         // chapter mechanisms are independent and files carry one, the other, or
@@ -464,12 +470,24 @@ impl Mp4File {
                 })
         });
 
+        // Read the chapter track's samples too, so the two mechanisms can be compared
+        // rather than one silently winning.
+        let chapter_track_chapters = moov
+            .and_then(|m| {
+                m.children_of(*b"trak")
+                    .into_iter()
+                    .find(|t| crate::chapter::is_chapter_list(t, m))
+            })
+            .and_then(|t| crate::chapter::read_text_track_chapters(t, data).ok())
+            .unwrap_or_default();
+
         Ok(Self {
             file_type,
             movie,
             tracks,
             metadata,
-            chapters,
+            chpl_chapters,
+            chapter_track_chapters,
             chapter_track_id,
         })
     }
@@ -505,6 +523,54 @@ impl Mp4File {
         self.audio_track().is_some()
     }
 
+    /// The chapters a player would show, preferring the QuickTime chapter track.
+    ///
+    /// # Why the track wins
+    ///
+    /// A chapter list exists in two independent forms and real files carry one, the
+    /// other, or both. Where both exist the track is preferred, because QuickTime,
+    /// iTunes and the built-in iOS audiobook player read the track and **ignore Nero
+    /// chapters entirely** — the `chpl` box is a Nero extension that predates them.
+    /// Preferring it would mean preferring the mechanism those players discard.
+    ///
+    /// A caller that wants both — to check they agree, or to fall back when one is
+    /// malformed — reads [`Mp4File::chpl_chapters`] and
+    /// [`Mp4File::chapter_track_chapters`] directly.
+    #[must_use]
+    pub fn effective_chapters(&self) -> &crate::chapter::ChapterList {
+        if self.chapter_track_chapters.chapters.is_empty() {
+            &self.chpl_chapters
+        } else {
+            &self.chapter_track_chapters
+        }
+    }
+
+    /// Whether the two chapter mechanisms are present and disagree.
+    ///
+    /// A real condition rather than a hypothetical: a muxer can write a `chpl` from one
+    /// source and a chapter track from another, and a library that silently prefers one
+    /// shows the user a list the file disagrees with. `None` when only one mechanism is
+    /// present, since then there is nothing to disagree about.
+    #[must_use]
+    pub fn chapter_disagreement(
+        &self,
+    ) -> Option<(&[crate::chapter::Chapter], &[crate::chapter::Chapter])> {
+        if self.chpl_chapters.chapters.is_empty() || self.chapter_track_chapters.chapters.is_empty()
+        {
+            return None;
+        }
+        let a = &self.chpl_chapters.chapters;
+        let b = &self.chapter_track_chapters.chapters;
+        if a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(x, y)| x.start_ms.abs_diff(y.start_ms) <= 2 && x.title == y.title)
+        {
+            return None;
+        }
+        Some((a, b))
+    }
+
     /// Whether this file is an audiobook by either signal.
     ///
     /// The brand alone is not trusted: a file can carry `M4B ` with no chapters,
@@ -513,7 +579,7 @@ impl Mp4File {
     #[must_use]
     pub fn is_audiobook(&self) -> bool {
         self.metadata.is_audiobook()
-            || !self.chapters.chapters.is_empty()
+            || !self.effective_chapters().chapters.is_empty()
             || self.chapter_track().is_some()
             || self
                 .file_type
