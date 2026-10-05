@@ -1,0 +1,43 @@
+[package]
+name = "mp4-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "ISO-BMFF (MP4/M4A/M4B) box reader and writer — ftyp, moov/trak/stbl, fragmented moof/traf, iTunes ilst metadata, Nero chpl chapters, no_std"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/WyattAu/mp4-core"
+keywords = ["mp4", "isobmff", "m4a", "m4b", "audiobook", "chapters", "no-std"]
+categories = ["multimedia::audio", "parser-implementations", "no-std"]
+exclude = [".github/", "fuzz/"]
+
+[features]
+default = []
+# `std` unlocks `std::error::Error`. The parser is `#![no_std]` + `alloc` either way.
+std = []
+
+[dependencies]
+# Sole runtime dependency: the typed error, matching every other L0 kit in the
+# estate (can-core, dbc-parse, dsp-core, id3-core).
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[package.metadata.layers]
+tier = "L0"
