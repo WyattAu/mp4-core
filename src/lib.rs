@@ -73,7 +73,7 @@ pub mod moov;
 pub mod sample;
 
 pub use chapter::{Chapter, ChapterList, MAX_CHPL_CHAPTERS, MAX_CHPL_TITLE_BYTES};
-pub use container::{parse_boxes, BoxType, Box_, Size, SizeForm};
+pub use container::{container, parse_boxes, BoxType, Box_, Size, SizeForm};
 pub use error::Mp4Error;
 pub use metadata::{atoms, DataType, Metadata, MetadataValue};
 pub use moov::{

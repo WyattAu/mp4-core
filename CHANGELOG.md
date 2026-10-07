@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+### Verified
+
+- **`mp4-core`'s `chpl` writer is byte-identical to ffmpeg's, and now there is a test that
+  says so.** The writer was checked only against this crate's own reader, which is the
+  arrangement that let the `chpl` layout defect survive several releases: a crate writes a
+  box, reads it back, and agrees with itself. `tests/chpl_ffmpeg.rs` holds the `chpl` box
+  captured from a real ffmpeg mux and asserts both that it parses to the chapters it
+  describes and that this crate's writer reproduces it **byte for byte**.
+
+  Byte-identity is stronger than "parses the same": if the bytes match, then everything
+  downstream — checksums, byte offsets, a muxer copying the box verbatim — behaves
+  identically too.
+
+- Two things about the format were only settled against the captured bytes while writing
+  it, and both are now documented on the fixture rather than left in someone's head:
+  the per-chapter start time is **eight** bytes wide, not four (invisible in the first
+  chapter, which is zero), and the ticks are the **movie** timescale rather than a fixed
+  rate — ffmpeg emits 100 000 000 for ten seconds, which no fixed-rate assumption
+  explains.
+
+  The fixture is generated from the captured hex rather than transcribed by hand, because
+  a hand transcription dropped the width and produced a box declaring 41 bytes while
+  carrying 25.
+
 ## [0.3.0] - 2026-10-05
 
 The QuickTime chapter track is now read, which closes the gap the conformance harness
