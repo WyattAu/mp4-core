@@ -126,3 +126,108 @@ fn minimal_mp4_with(box_bytes: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&moov_bytes);
     out
 }
+
+/// A parsed MP4 must re-serialize to exactly the bytes it was parsed from.
+///
+/// This is the test that did not exist when the full-box prefix was being dropped. Reading
+/// parses the original bytes once and never writes them back, so a parser that silently
+/// discarded eight bytes of every `stsd` and four of every `meta` was invisible to the
+/// whole suite: every box still parsed, every chapter was still found, and nothing looked
+/// wrong. A muxer writing from that tree produced a corrupt file.
+///
+/// The file here is the smallest one that catches it, because the fault is per *box type*
+/// and a `chpl` on its own has no full-box containers above it. `stsd` and `meta` are both
+/// required: `stsd` is the eight-byte case (version, flags, entry count) and `meta` the
+/// four-byte one (version, flags), and a fix for one that misses the other would pass.
+#[test]
+fn a_parsed_file_reserializes_to_the_same_bytes() {
+    // `stsd` under `stbl`, with an `mp4a` entry, and `meta` under `udta` with an `ilst`:
+    // both of the full-box containers the format actually puts in a file.
+    let mp4a_payload: Vec<u8> = [
+        &[0u8; 6][..],           // reserved
+        &1u16.to_be_bytes()[..], // data reference index
+        // AudioSampleEntry: the eight bytes that make `stsd`'s skip eight rather than four
+        // belong to the *stsd*, and what follows inside `mp4a` is version, revision,
+        // vendor, channel count, sample size, and the rest.
+        &[0u8; 8][..],
+        &2u16.to_be_bytes()[..],      // channel count
+        &16u16.to_be_bytes()[..],     // sample size
+        &[0u8; 4][..],                // pre-defined, reserved
+        &44_100u32.to_be_bytes()[..], // sample rate, 16.16 fixed point low half
+    ]
+    .concat();
+
+    let mp4a = mp4_core::Box_ {
+        box_type: *b"mp4a",
+        size: mp4_core::Size::Fixed(0),
+        size_form: mp4_core::SizeForm::Normal,
+        extended_type: None,
+        payload: mp4a_payload,
+        children: Vec::new(),
+    };
+    let stsd_body: Vec<u8> = [
+        &[0u8; 4][..],           // version and flags
+        &1u32.to_be_bytes()[..], // entry count
+    ]
+    .concat();
+    let stsd = mp4_core::Box_ {
+        box_type: *b"stsd",
+        size: mp4_core::Size::Fixed(0),
+        size_form: mp4_core::SizeForm::Normal,
+        extended_type: None,
+        payload: stsd_body,
+        children: vec![mp4a],
+    };
+    let stbl = mp4_core::container(*b"stbl", vec![stsd]);
+    let minf = mp4_core::container(*b"minf", vec![stbl]);
+    let mdia = mp4_core::container(*b"mdia", vec![minf]);
+    let trak = mp4_core::container(*b"trak", vec![mdia]);
+
+    let data_payload: Vec<u8> = [
+        &[0u8; 4][..], // version and flags
+        &[0u8; 4][..], // class, and a type code of zero
+        &b"text"[..],
+        &b"Chapter One"[..],
+    ]
+    .concat();
+    let data = mp4_core::Box_ {
+        box_type: *b"data",
+        size: mp4_core::Size::Fixed(0),
+        size_form: mp4_core::SizeForm::Normal,
+        extended_type: None,
+        payload: data_payload,
+        children: Vec::new(),
+    };
+    let ilst = mp4_core::container(*b"ilst", vec![data]);
+    // `meta` is a full box: four bytes of version and flags before its children.
+    let meta_body: Vec<u8> = [0u8; 4].to_vec();
+    let meta = mp4_core::Box_ {
+        box_type: *b"meta",
+        size: mp4_core::Size::Fixed(0),
+        size_form: mp4_core::SizeForm::Normal,
+        extended_type: None,
+        payload: meta_body,
+        children: vec![ilst],
+    };
+    let udta = mp4_core::container(*b"udta", vec![meta]);
+    let moov = mp4_core::container(*b"moov", vec![trak, udta]);
+
+    let file = moov.to_bytes();
+
+    // The round trip: parse what was written, write it again, compare.
+    let parsed = mp4_core::parse_boxes(&file).expect("a file this crate wrote must parse");
+    let mut reserialized = Vec::with_capacity(file.len());
+    for box_ in &parsed {
+        reserialized.extend_from_slice(&box_.to_bytes());
+    }
+    assert_eq!(
+        reserialized.len(),
+        file.len(),
+        "the round trip must not change the file's length"
+    );
+    assert_eq!(
+        reserialized, file,
+        "and not one byte of it either \u{2014} a full-box container's prefix is part of \
+         the box"
+    );
+}

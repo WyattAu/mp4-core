@@ -1,6 +1,6 @@
 [package]
 name = "mp4-core"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.85"
 description = "ISO-BMFF (MP4/M4A/M4B) box reader and writer — ftyp, moov/trak/stbl, fragmented moof/traf, iTunes ilst metadata, Nero chpl chapters, no_std"

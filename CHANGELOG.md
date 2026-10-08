@@ -27,6 +27,33 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
   a hand transcription dropped the width and produced a box declaring 41 bytes while
   carrying 25.
 
+## [0.3.1] - 2026-10-08
+
+A defect found by trying to write chapters into an M4B, which no test had done.
+
+### Fixed
+
+- **A parsed `stsd` or `meta` box re-serialized 8 or 4 bytes short.** Both are full-box
+  containers: they carry a version, flags and (for `stsd`) an entry count before their
+  children. The parser skipped that prefix to find the children and then stored an empty
+  payload, so the prefix was dropped on the way out.
+
+  Reading never noticed, because reading parses the original bytes once and never
+  re-serializes them — every box still parsed, every chapter was still found, and the
+  whole suite was green. Writing exposed it immediately: a `moov` round-tripped through
+  this module was short by the sum of the prefixes its full-box containers had dropped,
+  and the M4B a muxer wrote from it was corrupt in a way no reader of the original would
+  have predicted.
+
+  The prefix is now kept in the box's payload, so `parse` followed by `to_bytes` is the
+  identity. `tests/chpl_ffmpeg.rs` pins it with a synthetic file carrying both an `stsd`
+  and a `meta`, because a fix for one that misses the other would pass.
+
+  Found from `audiobook-shelf`, whose M4B write path is the first thing in the estate to
+  re-serialize a parsed MP4. The failing assertion named the wrong suspect at first — a
+  length mismatch three boxes away from the box that lost the bytes — which is why the
+  round-trip is now asserted on whole files rather than on individual boxes.
+
 ## [0.3.0] - 2026-10-05
 
 The QuickTime chapter track is now read, which closes the gap the conformance harness

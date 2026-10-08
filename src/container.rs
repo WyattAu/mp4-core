@@ -389,10 +389,10 @@ pub fn parse_boxes(data: &[u8]) -> Result<Vec<Box_>, Mp4Error> {
         let payload = rest
             .get(body_start..body_start + payload_len)
             .unwrap_or(&[]);
+        let skip = full_box_header_len(&box_type);
         let children = if is_container_type(&box_type) {
             // A full-box container's children start after its own header, which
             // for `stsd` includes the entry count.
-            let skip = full_box_header_len(&box_type);
             let inner = if skip == 0 {
                 payload
             } else {
@@ -403,11 +403,21 @@ pub fn parse_boxes(data: &[u8]) -> Result<Vec<Box_>, Mp4Error> {
             Vec::new()
         };
 
-        // A container's payload must not be duplicated into `payload`.
+        // A container's payload must not be duplicated into `payload` — but a full-box
+        // container's prefix must be kept, because it *is* part of the box: the version,
+        // the flags, and for `stsd` the entry count. Dropping it serializes a box eight
+        // bytes short (`stsd`) or four (`meta`), and the file a muxer writes from that
+        // tree is corrupt in a way no reader of the original would have predicted.
+        //
+        // Reading never noticed, because reading parses the original bytes once and never
+        // re-serializes them. Writing did: a `moov` round-tripped through this module was
+        // short by exactly the sum of the prefixes its full-box containers had dropped.
         let stored_payload: Vec<u8> = if children.is_empty() {
             payload.to_vec()
-        } else {
+        } else if skip == 0 {
             Vec::new()
+        } else {
+            payload.get(..skip).unwrap_or(&[]).to_vec()
         };
 
         out.push(Box_ {
