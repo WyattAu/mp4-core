@@ -27,6 +27,43 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
   a hand transcription dropped the width and produced a box declaring 41 bytes while
   carrying 25.
 
+### Added
+
+- **`io` — the box walk that finds a `moov` without reading a file.** `read_top_level`
+  reads sixteen bytes per top-level box and skips the rest by declared size, so a
+  64 MB `mdat` costs one header; `read_box` then fetches only the box wanted. A file
+  larger than memory becomes readable, which for an audiobook library is the actual
+  requirement: a 2 GB M4B is normal, and `Mp4File::parse` takes a slice.
+
+  Both refuse rather than clamp. A box claiming past the end of the file is
+  `TruncatedBox`, not a box of a plausible wrong length, because every field derived
+  from a clamped box would be a plausible wrong answer.
+
+- **`Mp4File::parse_from`, for a `moov` that has been read on its own**, and
+  `read_text_track_chapters_from`, which fetches each chapter sample with one bounded
+  read where the sample table says it is. Together they are how a probe finds duration,
+  metadata and chapters in a multi-gigabyte M4B without holding it. `chpl` is looked for
+  inside the `moov`, where Nero's spec puts it; a box outside any container, which
+  `Mp4File::parse` would also find, is not something a `moov` window can see, and that
+  is recorded here rather than implied by silence.
+
+- **`ByteReader`**, the random-access contract behind both: a length and a
+  fill-a-buffer-from-an-offset. Deliberately not `std::io::Read` — this crate is
+  `no_std`, and a short read at the end of a file is a normal outcome rather than an
+  error, which `Read`'s shape encourages callers to treat as one.
+
+- **`MAX_SAMPLE_BYTES`**, a per-sample read cap, because a chapter title's length comes
+  from the file and a corrupt `stsz` entry must not become a multi-gigabyte read.
+
+### Verified
+
+- The windowed summary agrees with the whole-file summary on every field — duration,
+  title, artist, `chpl`, chapter track, track id — on a file shaped the way ffmpeg
+  writes them, `ftyp | mdat | moov` with the metadata at the end. That shape is the
+  reason a head-only window cannot work.
+- Finding the `moov` of a 4 MB file costs under 8 KB of reads, asserted by a counting
+  reader: two headers and the `moov` itself, nothing else.
+
 ## [0.3.1] - 2026-10-08
 
 A defect found by trying to write chapters into an M4B, which no test had done.

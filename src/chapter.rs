@@ -312,6 +312,17 @@ impl ChapterList {
     #[must_use]
     pub fn find_chpl(data: &[u8]) -> Option<ChapterList> {
         let boxes = crate::container::parse_boxes(data).ok()?;
+        Self::find_chpl_in(boxes)
+    }
+
+    /// Locate and parse a `chpl` box in a tree that has already been parsed.
+    ///
+    /// [`ChapterList::find_chpl`] is this for raw file bytes; this is the form for a
+    /// caller that parsed a `moov` on its own, which is where the box lives in a real
+    /// M4B. The search is the same walk, so the two cannot disagree about what a `chpl`
+    /// is — that is the point of keeping one under the other.
+    #[must_use]
+    pub fn find_chpl_in(children: alloc::vec::Vec<Box_>) -> Option<ChapterList> {
         let mut found: Option<Box_> = None;
         crate::container::walk(
             &Box_ {
@@ -320,7 +331,7 @@ impl ChapterList {
                 size_form: crate::container::SizeForm::Normal,
                 extended_type: None,
                 payload: Vec::new(),
-                children: boxes,
+                children,
             },
             &mut |b| {
                 if b.box_type == *b"chpl" {
@@ -418,7 +429,29 @@ fn reference_id(chap: &Box_) -> Option<u32> {
 ///
 /// [`Mp4Error::MissingBox`] when the sample table is absent, and
 /// [`Mp4Error::TruncatedBox`] when a sample lies outside `file`.
-pub fn read_text_track_chapters(track: &Box_, file: &[u8]) -> Result<ChapterList, Mp4Error> {
+/// The maximum bytes read for one chapter's text sample.
+///
+/// A chapter title is a two-byte length followed by that many bytes plus a 12-byte
+/// `encd` box, so 64 KiB is beyond anything a title needs. The cap exists because the
+/// sample *size* comes from the file: a corrupt `stsz` entry must not become a
+/// multi-gigabyte read.
+pub const MAX_SAMPLE_BYTES: usize = 64 * 1024;
+
+/// Read a chapter track's titles and times, one bounded read per sample.
+///
+/// This is [`read_text_track_chapters`] for a caller that does not have the whole file in
+/// memory — which is the normal case for a library holding multi-gigabyte books. The
+/// sample table says where each chapter's bytes are; each is fetched separately, so the
+/// cost is one read per chapter rather than one file.
+///
+/// # Errors
+///
+/// The same errors as [`read_text_track_chapters`], plus [`Mp4Error::TruncatedBox`] when
+/// a sample's bytes run past the end of the file.
+pub fn read_text_track_chapters_from(
+    track: &Box_,
+    reader: &mut impl crate::io::ByteReader,
+) -> Result<ChapterList, Mp4Error> {
     let stbl = track
         .child(*b"mdia")
         .and_then(|m| m.child(*b"minf"))
@@ -436,23 +469,42 @@ pub fn read_text_track_chapters(track: &Box_, file: &[u8]) -> Result<ChapterList
 
     let mut chapters = Vec::with_capacity(table.sample_count as usize);
     for i in 0..table.sample_count as usize {
-        // An incomplete table cannot place the sample. Stopping is much better than
-        // reading a plausible-looking offset: a wrong offset yields bytes that look
-        // like text, so the failure would be garbage titles rather than an error.
         let (Some(offset), Some(size)) = (table.offsets.get(i), table.sizes.get(i)) else {
             break;
         };
-        let bytes = table.sample_bytes(i, file).ok_or(Mp4Error::TruncatedBox {
-            box_type: *b"mdat",
-            declared: offset.saturating_add(u64::from(*size)),
-            available: file.len(),
-        })?;
+        // Bounded per sample, whatever the table says the sample is.
+        let want = (*size as usize).min(MAX_SAMPLE_BYTES);
+        let mut buf = alloc::vec![0u8; want];
+        let read = reader.read_at(*offset, &mut buf).unwrap_or(0);
+        let available = u64::try_from(read).unwrap_or(0);
+        if available < u64::from(*size) {
+            return Err(Mp4Error::TruncatedBox {
+                box_type: *b"mdat",
+                declared: offset.saturating_add(u64::from(*size)),
+                available: usize::try_from(available).unwrap_or(usize::MAX),
+            });
+        }
+        buf.truncate(read);
         chapters.push(Chapter {
             start_ms: table.start_time(i, timescale).unwrap_or(0),
-            title: decode_text_sample(bytes),
+            title: decode_text_sample(&buf),
         });
     }
     Ok(ChapterList { chapters })
+}
+
+/// Read a chapter track's titles and times from a file already in memory.
+///
+/// A thin form of [`read_text_track_chapters_from`], and kept because a caller holding
+/// the whole file should not manufacture a reader to use it. The two share one
+/// implementation, so a change to one is a change to both.
+///
+/// # Errors
+///
+/// [`Mp4Error::TruncatedBox`] when a sample's bytes run past the end of the file.
+pub fn read_text_track_chapters(track: &Box_, file: &[u8]) -> Result<ChapterList, Mp4Error> {
+    let mut reader: &[u8] = file;
+    read_text_track_chapters_from(track, &mut reader)
 }
 
 /// Read just the titles of a QuickTime chapter track, without their times.

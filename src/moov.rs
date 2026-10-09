@@ -492,6 +492,83 @@ impl Mp4File {
         })
     }
 
+    /// Summarise a file whose `moov` has been read on its own.
+    ///
+    /// [`Mp4File::parse`] takes whole file bytes; this takes the `moov` box and a reader
+    /// for the rest, which is how a library probes a two-gigabyte audiobook without
+    /// holding two gigabytes. Everything except the chapter track's *samples* comes from
+    /// the `moov`; the samples live in `mdat` and are fetched one bounded read each,
+    /// where the sample table says they are.
+    ///
+    /// The `ftyp` payload is optional and only feeds [`Mp4File::file_type`]. `chpl` is
+    /// looked for inside the `moov` — which is where Nero's spec puts it — where
+    /// [`Mp4File::parse`] also finds one at file level, because a box outside any
+    /// container is not something the `moov` window can see.
+    pub fn parse_from(
+        ftyp_payload: Option<&[u8]>,
+        moov: Option<&Box_>,
+        reader: &mut impl crate::io::ByteReader,
+    ) -> Self {
+        let file_type = ftyp_payload.and_then(|p| FileType::parse(p).ok());
+
+        let movie = moov
+            .and_then(|m| m.child(*b"mvhd"))
+            .and_then(|b| MovieHeader::parse(&b.payload).ok());
+
+        let movie_timescale = movie.map_or(1, |m| if m.timescale == 0 { 1 } else { m.timescale });
+
+        let mut tracks = Vec::new();
+        if let Some(m) = moov {
+            for trak in m.children_of(*b"trak") {
+                if let Ok(t) = Track::parse(trak, movie_timescale) {
+                    tracks.push(t);
+                }
+            }
+        }
+
+        let metadata = moov
+            .and_then(|m| m.child(*b"udta"))
+            .and_then(|u| u.child(*b"meta"))
+            .and_then(crate::metadata::parse_meta)
+            .unwrap_or_default();
+
+        // `chpl` inside the moov, by the same walk `find_chpl` uses on whole bytes.
+        let chpl_chapters = moov
+            .and_then(|m| crate::chapter::ChapterList::find_chpl_in(m.children.clone()))
+            .unwrap_or_default();
+
+        let chapter_track_id = moov.and_then(|m| {
+            m.children_of(*b"trak")
+                .into_iter()
+                .find(|t| crate::chapter::is_chapter_list(t, m))
+                .and_then(|t| t.child(*b"tkhd"))
+                .and_then(|tk| {
+                    let ver = tk.payload.first().copied()?;
+                    let off = if ver == 1 { 20 } else { 12 };
+                    u32_at(&tk.payload, off, "tkhd track id").ok()
+                })
+        });
+
+        let chapter_track_chapters = moov
+            .and_then(|m| {
+                m.children_of(*b"trak")
+                    .into_iter()
+                    .find(|t| crate::chapter::is_chapter_list(t, m))
+            })
+            .and_then(|t| crate::chapter::read_text_track_chapters_from(t, reader).ok())
+            .unwrap_or_default();
+
+        Self {
+            file_type,
+            movie,
+            tracks,
+            metadata,
+            chpl_chapters,
+            chapter_track_chapters,
+            chapter_track_id,
+        }
+    }
+
     /// The first audio track.
     #[must_use]
     pub fn audio_track(&self) -> Option<&Track> {
