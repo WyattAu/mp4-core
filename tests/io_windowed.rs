@@ -7,12 +7,17 @@
 //! compared on every field the summary has, and the volume of I/O is asserted too,
 //! because an unbounded "windowed" reader would pass every field check while being the
 //! thing it exists to not be.
+//!
+//! Test fixtures here are allowed to assert: an `expect` is the test saying what it
+//! assumes, which is the honest form, and the crate lint denies it everywhere a caller
+//! would write it.
+
+#![allow(clippy::expect_used)]
 
 use mp4_core::chapter::{Chapter, ChapterList};
 use mp4_core::container::{container, leaf, Box_};
 use mp4_core::io::{read_box, read_top_level, ByteReader, TopLevelBox};
-use mp4_core::metadata::{atoms, Metadata};
-use mp4_core::metadata::{Atom, MetadataValue};
+use mp4_core::metadata::{atoms, Atom, Metadata, MetadataValue};
 use mp4_core::moov::{FileType, MovieHeader};
 use mp4_core::Mp4File;
 
