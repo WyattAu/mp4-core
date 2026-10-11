@@ -79,7 +79,7 @@ pub use error::Mp4Error;
 pub use io::{read_box, read_top_level, ByteReader, TopLevelBox};
 pub use metadata::{atoms, DataType, Metadata, MetadataValue};
 pub use moov::{
-    duration_ms, read_ftyp, read_mvhd, read_tracks, FileType, HandlerType, MediaHeader,
-    MovieHeader, Mp4File, Track, TrackHeader,
+    duration_ms, read_ftyp, read_mvhd, read_sample_rate_in, read_tracks, FileType, HandlerType,
+    MediaHeader, MovieHeader, Mp4File, Track, TrackHeader,
 };
 pub use sample::{read_sample_table, SampleTable};

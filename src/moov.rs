@@ -682,6 +682,16 @@ impl Mp4File {
 pub fn read_sample_rate(data: &[u8]) -> Option<u32> {
     let boxes = parse_boxes(data).ok()?;
     let moov = boxes.iter().find(|b| b.box_type == *b"moov")?;
+    read_sample_rate_in(moov)
+}
+
+/// A file's audio sample rate, from a `moov` that has been parsed on its own.
+///
+/// [`read_sample_rate`] is this for whole file bytes; this is the form for the windowed
+/// reader, which has a `moov` and no file. One walks the other's tree, so the two cannot
+/// disagree about where a sample rate lives.
+#[must_use]
+pub fn read_sample_rate_in(moov: &Box_) -> Option<u32> {
     for trak in moov.children_of(*b"trak") {
         let Some(stsd) = trak
             .child(*b"mdia")
