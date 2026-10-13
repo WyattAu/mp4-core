@@ -33,8 +33,8 @@ use alloc::vec::Vec;
 use crate::container::{parse_boxes, Box_};
 use crate::error::Mp4Error;
 use crate::fields::{
-    audio_sample_rate, f64_to_fixed_16_16, fixed_16_16_to_f64, push_u16, push_u32, u32_at, u64_at,
-    version,
+    audio_sample_rate, f64_to_fixed_16_16, fixed_16_16_to_f64, push_u16, push_u32, u16_at, u32_at,
+    u64_at, version,
 };
 use crate::metadata::Metadata;
 
@@ -687,6 +687,49 @@ pub fn read_sample_rate(data: &[u8]) -> Option<u32> {
 
 /// A file's audio sample rate, from a `moov` that has been parsed on its own.
 ///
+/// A file's video dimensions, from a `moov` that has been parsed on its own.
+///
+/// [`read_sample_rate`] reads the *audio* track's rate; this reads the first
+/// video track's pixel dimensions from its sample entry. Both are the fields a
+/// library displays before playing anything.
+#[must_use]
+pub fn read_video_dimensions_in(moov: &Box_) -> Option<(u32, u32)> {
+    for trak in moov.children_of(*b"trak") {
+        let Some(stsd) = trak
+            .child(*b"mdia")
+            .and_then(|m| m.child(*b"minf"))
+            .and_then(|m| m.child(*b"stbl"))
+            .and_then(|s| s.child(*b"stsd"))
+        else {
+            continue;
+        };
+        let Some(entry) = stsd.children.first() else {
+            continue;
+        };
+        // Visual sample entries carry pixel dimensions at payload offsets 24
+        // and 26: six reserved bytes, the data-reference index, then sixteen
+        // bytes of pre-defined/reserved space. Audio entries (mp4a) have
+        // channel and sample-size fields there instead, so a video entry type
+        // must be matched explicitly.
+        // A video sample entry declares itself with one of these types; audio
+        // entries (mp4a) have different fields at the same offsets.
+        let video = [
+            *b"avc1", *b"avc3", *b"hev1", *b"hvc1", *b"mp4v", *b"vp08", *b"vp09", *b"av01",
+        ]
+        .contains(&entry.box_type);
+        if !video {
+            continue;
+        }
+        let width = u16_at(&entry.payload, 24, "video width").ok()?;
+        let height = u16_at(&entry.payload, 26, "video height").ok()?;
+        if width == 0 && height == 0 {
+            continue;
+        }
+        return Some((u32::from(width), u32::from(height)));
+    }
+    None
+}
+
 /// [`read_sample_rate`] is this for whole file bytes; this is the form for the windowed
 /// reader, which has a `moov` and no file. One walks the other's tree, so the two cannot
 /// disagree about where a sample rate lives.
