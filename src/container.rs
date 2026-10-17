@@ -500,9 +500,12 @@ pub fn empty(box_type: BoxType) -> Box_ {
 #[must_use]
 pub fn full_box_container_box(box_type: BoxType, children: Vec<Box_>) -> Box_ {
     let mut c = container(box_type, children);
-    // `container` writes only children; a full box needs the header inside the
-    // payload, so rebuild the payload here rather than in `to_bytes`.
-    let mut payload: Vec<u8> = vec![0u8, 0, 0, 0];
+    // `container` writes only children; a full box needs its header (version,
+    // flags, and for `stsd` the entry count) inside the payload, so rebuild
+    // the payload here rather than in `to_bytes`. The prefix width comes from
+    // the same table parsing uses — a hand-written four baked in a `meta`
+    // bias and made every `stsd` built this way unparseable.
+    let mut payload = vec![0u8; full_box_header_len(&box_type)];
     for child in &c.children {
         payload.extend_from_slice(&child.to_bytes());
     }
@@ -552,3 +555,317 @@ pub fn encoded_len(boxes: &[Box_]) -> u64 {
 
 /// A boxed value, so recursion through `Box_` is one pointer wide.
 pub type BoxRef = Box<Box_>;
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use super::*;
+    use alloc::vec;
+
+    // Fixtures are allowed to assert: an `unwrap` here is the test stating
+    // what it assumes, the honest form, and the crate lint denies it
+    // everywhere a caller would write it.
+
+    const FOURCC_MOOV: BoxType = *b"moov";
+    const FOURCC_FREE: BoxType = *b"free";
+    const FOURCC_TINY: BoxType = *b"tiny";
+    const FOURCC_BIGR: BoxType = *b"bigr";
+
+    fn leaf_bytes(box_type: BoxType, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let total = u32::try_from(8 + payload.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(&box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn display_type_renders_printable_and_dots_the_rest() {
+        assert_eq!(display_type(&FOURCC_MOOV), "moov");
+        assert_eq!(display_type(b"m v "), "m v ", "space is kept");
+        assert_eq!(display_type(&[0x00, b'a', 0x01, 0x7f]), ".a..");
+    }
+
+    #[test]
+    fn size_header_len_is_eight_for_both_basic_forms() {
+        assert_eq!(Size::Fixed(10).header_len(), 8);
+        assert_eq!(Size::ToEnd.header_len(), 8);
+    }
+
+    #[test]
+    fn type_str_transliterates_the_copyright_prefix() {
+        assert_eq!(type_str(b"moov"), "moov");
+        assert_eq!(type_str(&[0xA9, b'n', b'a', b'm']), "\u{a9}nam");
+        // A non-UTF-8 tail after the prefix falls back to '?'.
+        assert_eq!(type_str(&[0xA9, 0xFF, 0xFE, 0xFD]), "?");
+        // The non-UTF-8 fallback maps each byte through char::from
+        // (Latin-1), not through display_type's dot rule.
+        assert_eq!(type_str(&[0x00, 0xFF, 0x01, 0x02]), "\0\u{ff}\u{1}\u{2}");
+    }
+
+    #[test]
+    fn box_type_str_uses_the_free_function() {
+        let leaf_box = leaf(FOURCC_MOOV, vec![1]).expect("leaf");
+        assert_eq!(leaf_box.type_str(), "moov");
+    }
+
+    #[test]
+    fn ilst_atoms_are_the_copyright_namespace_plus_the_named_set() {
+        assert!(is_ilst_atom(&[0xA9, b'n', b'a', b'm']));
+        assert!(is_ilst_atom(b"covr"));
+        assert!(is_ilst_atom(b"trkn"));
+        assert!(!is_ilst_atom(b"moov"));
+    }
+
+    #[test]
+    fn full_box_headers_are_meta_four_and_stsd_eight() {
+        assert_eq!(full_box_header_len(b"meta"), 4);
+        assert_eq!(full_box_header_len(b"stsd"), 8);
+        assert_eq!(full_box_header_len(b"moov"), 0);
+        assert!(full_box_container(b"meta"));
+        assert!(!full_box_container(b"mdat"));
+    }
+
+    #[test]
+    fn container_types_are_the_explicit_set() {
+        assert!(is_container_type(b"moov"));
+        assert!(is_container_type(b"trak"));
+        assert!(is_container_type(b"stsd"));
+        assert!(!is_container_type(b"mdat"));
+        assert!(!is_container_type(b"free"));
+    }
+
+    #[test]
+    fn parse_boxes_reads_a_simple_leaf() {
+        let data = leaf_bytes(*b"free", b"hello");
+        let boxes = parse_boxes(&data).expect("parses");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].box_type, FOURCC_FREE);
+        assert_eq!(boxes[0].payload, b"hello");
+        assert!(boxes[0].children.is_empty());
+    }
+
+    #[test]
+    fn parse_boxes_stops_at_trailing_padding() {
+        // The stop rule is "the remainder is all zero" — padding written to
+        // the end of a container, the common real-world shape.
+        let mut data = leaf_bytes(*b"free", b"x");
+        data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let boxes = parse_boxes(&data).expect("parses");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].payload, b"x");
+    }
+
+    #[test]
+    fn a_short_tail_below_a_header_is_ignored() {
+        // Fewer than eight trailing bytes: padding or truncation, not a box.
+        let mut data = leaf_bytes(*b"free", b"x");
+        data.extend_from_slice(&[1, 2, 3]);
+        let boxes = parse_boxes(&data).expect("parses");
+        assert_eq!(boxes.len(), 1);
+    }
+
+    #[test]
+    fn largesize_form_parses_a_sixteen_byte_header() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_be_bytes()); // size == 1: largesize form
+        data.extend_from_slice(&b"big1"[..]);
+        let body = b"the payload";
+        data.extend_from_slice(&u64::try_from(16 + body.len()).unwrap().to_be_bytes());
+        data.extend_from_slice(body);
+
+        let boxes = parse_boxes(&data).expect("parses");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].size_form, SizeForm::Large);
+        assert_eq!(
+            boxes[0].size,
+            Size::Fixed(u64::try_from(16 + body.len()).unwrap())
+        );
+        assert_eq!(boxes[0].payload, body);
+    }
+
+    #[test]
+    fn a_largesize_box_with_a_truncated_wide_field_is_an_error() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&b"big1"[..]);
+        data.extend_from_slice(&[0, 0, 0]); // three bytes: not a u64
+        let err = parse_boxes(&data).expect_err("truncated largesize");
+        assert!(matches!(err, Mp4Error::TruncatedBox { declared: 16, .. }));
+    }
+
+    #[test]
+    fn to_end_form_consumes_the_rest() {
+        let mut data = leaf_bytes(*b"free", b"kept");
+        data.extend_from_slice(&0u32.to_be_bytes()); // size 0: to end
+        data.extend_from_slice(&b"tail"[..]);
+        let boxes = parse_boxes(&data).expect("parses");
+        assert_eq!(boxes.len(), 2, "the to-end box and the preceding leaf");
+        assert_eq!(boxes[1].size_form, SizeForm::ToEnd);
+        assert_eq!(boxes[1].size, Size::ToEnd);
+        assert_eq!(boxes[1].box_type, *b"tail");
+        assert_eq!(boxes[1].payload, b"", "the header was the last eight bytes");
+    }
+
+    #[test]
+    fn a_size_below_the_header_is_rejected() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&3u32.to_be_bytes()); // size 3 < header 8
+        data.extend_from_slice(&b"tiny"[..]);
+        let err = parse_boxes(&data).expect_err("size 3 < 8");
+        assert!(matches!(
+            err,
+            Mp4Error::InvalidBoxSize {
+                box_type: FOURCC_TINY,
+                size: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn a_size_past_the_available_bytes_is_truncation() {
+        let mut data = leaf_bytes(*b"free", b"abc");
+        data.extend_from_slice(&u32::try_from(8 + 100).unwrap().to_be_bytes());
+        data.extend_from_slice(&b"bigr"[..]);
+        // The trailing box claims 108 bytes but only 8 remain.
+        let err = parse_boxes(&data).expect_err("claims past the end");
+        assert!(matches!(
+            err,
+            Mp4Error::TruncatedBox {
+                box_type: FOURCC_BIGR,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn uuid_boxes_carry_their_extended_type() {
+        let ext: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap());
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::try_from(8 + 16 + 2).unwrap().to_be_bytes());
+        data.extend_from_slice(&b"uuid"[..]);
+        data.extend_from_slice(&ext);
+        data.extend_from_slice(b"zz");
+
+        let boxes = parse_boxes(&data).expect("parses");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].extended_type, Some(ext));
+        assert_eq!(boxes[0].payload, b"zz");
+    }
+
+    #[test]
+    fn a_uuid_box_without_room_for_the_extended_type_is_an_error() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::try_from(8 + 4).unwrap().to_be_bytes());
+        data.extend_from_slice(&b"uuid"[..]);
+        data.extend_from_slice(&[0, 1, 2, 3]); // four bytes: not sixteen
+        let err = parse_boxes(&data).expect_err("truncated extended type");
+        assert!(matches!(err, Mp4Error::InvalidExtendedType));
+    }
+
+    #[test]
+    fn full_box_containers_keep_their_prefix_and_descend_past_it() {
+        // meta: version+flags (4 bytes) then a free child — the child is
+        // part of meta's payload, because that is how the wire lays it out.
+        let data = full_box_container_box(
+            *b"meta",
+            vec![leaf(FOURCC_FREE, b"kid".to_vec()).expect("leaf")],
+        )
+        .to_bytes();
+
+        let boxes = parse_boxes(&data).expect("parses");
+        assert_eq!(boxes.len(), 1);
+        let meta = &boxes[0];
+        assert!(meta.is_container());
+        assert_eq!(meta.payload, &[0, 0, 0, 0], "the full-box prefix is kept");
+        assert_eq!(meta.children.len(), 1);
+        assert_eq!(meta.children[0].box_type, FOURCC_FREE);
+        // Round trip: the serialized meta is as long as the original.
+        assert_eq!(meta.to_bytes().len(), data.len());
+    }
+
+    #[test]
+    fn stsd_skips_eight_bytes_of_header_and_keeps_them() {
+        // stsd: version+flags (4) + entry_count (4), then one free child —
+        // inside stsd's payload, per the wire.
+        let data = full_box_container_box(
+            *b"stsd",
+            vec![leaf(FOURCC_FREE, b"s".to_vec()).expect("leaf")],
+        )
+        .to_bytes();
+        let boxes = parse_boxes(&data).expect("parses");
+        let stsd = &boxes[0];
+        assert_eq!(stsd.children.len(), 1);
+        assert_eq!(stsd.payload.len(), 8, "both header bytes are kept");
+        assert_eq!(stsd.to_bytes().len(), data.len(), "round trips exact");
+    }
+
+    #[test]
+    fn containers_nest_and_round_trip() {
+        let inner = container(
+            *b"trak",
+            vec![leaf(FOURCC_FREE, b"t".to_vec()).expect("leaf")],
+        );
+        let outer = container(
+            FOURCC_MOOV,
+            vec![inner, leaf(*b"udta", b"u".to_vec()).expect("leaf")],
+        );
+        let bytes = outer.to_bytes();
+
+        let parsed = parse_boxes(&bytes).expect("parses");
+        assert_eq!(parsed.len(), 1);
+        let moov = &parsed[0];
+        assert!(moov.is_container());
+        assert_eq!(moov.child(*b"trak").map(|c| c.box_type), Some(*b"trak"));
+        assert_eq!(moov.children_of(*b"udta").len(), 1);
+        assert_eq!(
+            moov.child(*b"trak")
+                .and_then(|t| t.child(*b"free"))
+                .map(|f| f.payload.as_slice()),
+            Some(b"t".as_slice())
+        );
+        assert_eq!(moov.encoded_len(), u64::try_from(bytes.len()).unwrap());
+        assert_eq!(moov.to_bytes(), bytes, "round trip is exact");
+    }
+
+    #[test]
+    fn encoded_len_covers_children_and_the_large_header() {
+        let child = leaf(FOURCC_FREE, b"payload".to_vec()).expect("leaf");
+        let parent = full_box_container_box(*b"meta", vec![child]);
+        // meta keeps its 4-byte prefix as payload: 8 header + 4 prefix + child.
+        let child_len = 8 + 7;
+        assert_eq!(
+            parent.encoded_len(),
+            u64::try_from(8 + 4 + child_len).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_top_level_and_first_box_pick_from_the_head_of_the_file() {
+        let mut data = leaf_bytes(*b"free", b"first");
+        data.extend_from_slice(&leaf_bytes(*b"moov", b"second"));
+        let moov = find_top_level(&data, *b"moov").expect("finds the moov");
+        assert_eq!(moov.payload, b"second");
+        assert!(find_top_level(&data, *b"mdat").is_none());
+        let first = first_box(&data).expect("first");
+        assert_eq!(first.box_type, FOURCC_FREE);
+    }
+
+    #[test]
+    fn empty_box_has_no_payload_and_containers_accept_children() {
+        let e = empty(FOURCC_FREE);
+        assert!(e.payload.is_empty());
+        assert_eq!(e.encoded_len(), 8);
+        let c = container(FOURCC_MOOV, vec![]);
+        assert!(c.children.is_empty());
+        let fc = full_box_container_box(*b"meta", vec![]);
+        assert_eq!(fc.payload.len(), 4, "the full-box prefix is retained");
+    }
+}

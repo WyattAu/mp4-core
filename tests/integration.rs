@@ -12,7 +12,7 @@
 //! the three size encodings, and the malformed inputs a real library meets.
 
 use mp4_core::chapter::{Chapter, ChapterList};
-use mp4_core::container::{container, leaf, parse_boxes, Size, SizeForm};
+use mp4_core::container::{container, full_box_container_box, leaf, parse_boxes, Size, SizeForm};
 use mp4_core::metadata::{atoms, DataType, Metadata, MetadataValue};
 use mp4_core::moov::{FileType, HandlerType, MovieHeader, Mp4File};
 use std::vec;
@@ -1260,5 +1260,257 @@ fn png_and_jpeg_art_get_distinct_type_flags() {
         jpeg.data_type,
         DataType::Jpeg,
         "JPEG magic must set flag 13"
+    );
+}
+
+/// A version-1 `tkhd`: 64-bit creation/modification and duration, track id at
+/// byte 20.
+fn tkhd_v1(track_id: u32, timescale: u32, duration_ms: u64) -> mp4_core::Box_ {
+    let units = duration_ms * u64::from(timescale) / 1000;
+    let mut payload = vec![1u8, 0, 0, 3]; // version 1, enabled|in-movie
+    payload.extend_from_slice(&0u64.to_be_bytes()); // creation
+    payload.extend_from_slice(&0u64.to_be_bytes()); // modification
+    payload.extend_from_slice(&track_id.to_be_bytes()); // at 20
+    payload.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    payload.extend_from_slice(&units.to_be_bytes()); // at 28, 64-bit
+    payload.extend_from_slice(&[0u8; 8]); // reserved
+    leaf(*b"tkhd", payload).expect("infallible")
+}
+
+/// A version-1 `mdhd`.
+fn mdhd_v1(timescale: u32, duration_ms: u64) -> mp4_core::Box_ {
+    let units = duration_ms * u64::from(timescale) / 1000;
+    let mut payload = vec![1u8, 0, 0, 0];
+    payload.extend_from_slice(&0u64.to_be_bytes());
+    payload.extend_from_slice(&0u64.to_be_bytes());
+    payload.extend_from_slice(&timescale.to_be_bytes()); // at 20
+    payload.extend_from_slice(&units.to_be_bytes()); // at 24, 64-bit
+    payload.extend_from_slice(&[0u8; 4]); // language+pre_defined
+    leaf(*b"mdhd", payload).expect("infallible")
+}
+
+/// A version-1 `mvhd` payload.
+fn mvhd_v1_payload(timescale: u32, duration_ms: u64) -> Vec<u8> {
+    let units = duration_ms * u64::from(timescale) / 1000;
+    let mut payload = vec![1u8, 0, 0, 0];
+    payload.extend_from_slice(&0u64.to_be_bytes());
+    payload.extend_from_slice(&0u64.to_be_bytes());
+    payload.extend_from_slice(&timescale.to_be_bytes()); // at 20
+    payload.extend_from_slice(&units.to_be_bytes()); // at 24, 64-bit
+    payload.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
+    payload.extend_from_slice(&[0u8; 10]); // volume + reserved
+    payload.extend_from_slice(&[0u8; 36]); // matrix
+    payload.extend_from_slice(&[0u8; 24]); // pre_defined
+    payload.extend_from_slice(&0u32.to_be_bytes()); // next_track_id
+    payload
+}
+
+#[test]
+fn version_one_headers_parse_their_wide_durations() {
+    let movie_ts = 1000u32;
+    let mvhd = leaf(*b"mvhd", mvhd_v1_payload(movie_ts, 12_345)).expect("infallible");
+    let tkhd = tkhd_v1(7, movie_ts, 12_345);
+    let mdhd = mdhd_v1(movie_ts, 12_345);
+    let mut hdlr_payload = vec![0u8, 0, 0, 0, 0, 0, 0, 0];
+    hdlr_payload.extend_from_slice(b"soun");
+    hdlr_payload.extend_from_slice(&[0u8; 12]);
+    let hdlr = leaf(*b"hdlr", hdlr_payload).expect("infallible");
+    let stbl = container(
+        *b"stbl",
+        vec![leaf(*b"stsd", vec![0u8, 0, 0, 0, 0, 0, 0, 1]).expect("infallible")],
+    );
+    let trak = container(
+        *b"trak",
+        vec![tkhd, container(*b"mdia", vec![mdhd, hdlr, stbl])],
+    );
+    let data = container(*b"moov", vec![mvhd, trak]).to_bytes();
+
+    let file = Mp4File::parse(&data).expect("a version-1 moov parses");
+    assert_eq!(
+        file.duration_ms(),
+        Some(12_345),
+        "the wide duration survives"
+    );
+
+    // The track's own parse carries the v1 tkhd path too.
+    let parsed_moov = mp4_core::container::find_top_level(&data, *b"moov").expect("moov");
+    let trak = parsed_moov.child(*b"trak").expect("the trak is there");
+    let parsed_track = mp4_core::moov::Track::parse(trak, movie_ts);
+    assert!(parsed_track.is_ok(), "a v1 track parses");
+}
+
+#[test]
+fn a_zero_movie_timescale_falls_back_to_one_rather_than_dividing_by_zero() {
+    // tkhd/mdhd carry their own timescale=1000; the movie header is absent, so
+    // the movie timescale is 0 — the reader falls back to 1 for the division.
+    let trak = audio_trak(1, 1000, 5_000);
+    // Strip the mvhd: take only the trak out of a moov.
+    let data = container(*b"moov", vec![trak]).to_bytes();
+    let parsed = mp4_core::container::find_top_level(&data, *b"moov").expect("moov");
+    let trak = parsed.child(*b"trak").expect("the trak is there");
+    let track = mp4_core::moov::Track::parse(trak, 0).expect("parses with timescale 0");
+    assert_eq!(
+        track.media.duration_ms, 5_000,
+        "the mdhd's own timescale does the conversion"
+    );
+}
+
+#[test]
+fn brand_compatibility_covers_the_major_brand_itself() {
+    use mp4_core::moov::FileType;
+    // A real ftyp payload: major M4A, compatible [M4A, iso2, mp41].
+    let mut payload = vec![b'M', b'4', b'A', b' '];
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(b"M4A ");
+    payload.extend_from_slice(b"iso2");
+    payload.extend_from_slice(b"mp41");
+    let ftyp = FileType::parse(&payload).expect("parses");
+    assert!(ftyp.is_compatible_with(ftyp.major_brand));
+    assert!(ftyp.is_compatible_with(*b"iso2"));
+    assert!(!ftyp.is_compatible_with(*b"qt  "));
+}
+
+#[test]
+fn a_file_with_an_audio_track_answers_has_audio_track() {
+    let data = audio_moov(1000, 4_000);
+    let file = Mp4File::parse(&data).expect("parses");
+    assert!(file.has_audio_track());
+}
+
+/// A `moov` carrying a video track whose sample entry is `entry_type` with
+/// the given width/height in the sample-entry payload.
+fn video_moov(entry_type: &[u8; 4], width: u16, height: u16) -> Vec<u8> {
+    let mut entry_payload = vec![0u8; 28];
+    entry_payload[24] = (width >> 8) as u8;
+    entry_payload[25] = (width & 0xFF) as u8;
+    entry_payload[26] = (height >> 8) as u8;
+    entry_payload[27] = (height & 0xFF) as u8;
+    let entry = leaf(*entry_type, entry_payload).expect("infallible");
+    // stsd: version+flags+entry_count, then the entry. The walk passes
+    // through minf → stbl → stsd, so the stbl must be in the tree.
+    let stsd = full_box_container_box(*b"stsd", vec![entry]);
+    let stbl = container(*b"stbl", vec![stsd]);
+    let minf = container(*b"minf", vec![stbl]);
+    let mdia = container(*b"mdia", vec![minf]);
+    let mvhd = leaf(
+        *b"mvhd",
+        mp4_core::moov::MovieHeader::to_payload(1000, 1_000),
+    )
+    .expect("infallible");
+    let trak = container(*b"trak", vec![mdia]);
+    container(*b"moov", vec![mvhd, trak]).to_bytes()
+}
+
+#[test]
+fn video_dimensions_read_from_the_sample_entry() {
+    let data = video_moov(b"avc1", 1920, 1080);
+    let moov = mp4_core::container::find_top_level(&data, *b"moov").expect("moov");
+    // Walk the tree by hand to find where the reader stops.
+    let mut node = &moov;
+    for step in ["trak", "mdia", "minf", "stbl", "stsd"] {
+        let fourcc: [u8; 4] = step.as_bytes()[..4].try_into().unwrap();
+        match node.child(fourcc) {
+            Some(child) => {
+                println!("found {step}: children {}", child.children.len());
+                println!(
+                    "  {step} payload len {}, box_type {:?}",
+                    node.payload.len(),
+                    node.box_type
+                );
+                node = child;
+            }
+            None => {
+                let kinds: Vec<_> = node
+                    .children
+                    .iter()
+                    .map(|c| String::from_utf8_lossy(&c.box_type).into_owned())
+                    .collect();
+                panic!("MISSING {step}: parent children {kinds:?}");
+            }
+        }
+    }
+    assert_eq!(
+        mp4_core::read_video_dimensions_in(&moov),
+        Some((1920, 1080)),
+        "the dimensions live at payload offsets 24/26"
+    );
+}
+
+#[test]
+fn audio_tracks_yield_no_video_dimensions() {
+    // mp4a's payload has channel/sample-size fields at those offsets — a
+    // reader that ignored the entry type would report garbage dimensions.
+    let mut entry_payload = vec![0u8; 28];
+    entry_payload[24] = 0;
+    entry_payload[25] = 2; // channels would be 2, not a width
+    let entry = leaf(*b"mp4a", entry_payload).expect("infallible");
+    let stsd = full_box_container_box(*b"stsd", vec![entry]);
+    let mdia = container(*b"mdia", vec![container(*b"minf", vec![stsd])]);
+    let trak = container(*b"trak", vec![mdia]);
+    let data = container(*b"moov", vec![trak]).to_bytes();
+    let moov = mp4_core::container::find_top_level(&data, *b"moov").expect("moov");
+    assert_eq!(
+        mp4_core::read_video_dimensions_in(&moov),
+        None,
+        "an audio entry is not a width/height pair"
+    );
+}
+
+#[test]
+fn zero_dimensions_are_skipped_for_a_later_track() {
+    // Track 1: avc1 declaring 0x0 (a placeholder). Track 2: hev1 with real
+    // dimensions. The reader skips the empty one rather than returning it.
+    let empty = leaf(*b"avc1", vec![0u8; 28]).expect("infallible");
+    let mut real_payload = vec![0u8; 28];
+    real_payload[24] = (640 >> 8) as u8;
+    real_payload[25] = (640 & 0xFF) as u8;
+    real_payload[26] = (360 >> 8) as u8;
+    real_payload[27] = (360 & 0xFF) as u8;
+    let real = leaf(*b"hev1", real_payload).expect("infallible");
+    let stsd1 = full_box_container_box(*b"stsd", vec![empty]);
+    let stsd2 = full_box_container_box(*b"stsd", vec![real]);
+    let minf1 = container(*b"minf", vec![container(*b"stbl", vec![stsd1])]);
+    let minf2 = container(*b"minf", vec![container(*b"stbl", vec![stsd2])]);
+    let trak1 = container(*b"trak", vec![container(*b"mdia", vec![minf1])]);
+    let trak2 = container(*b"trak", vec![container(*b"mdia", vec![minf2])]);
+    let mvhd = leaf(
+        *b"mvhd",
+        mp4_core::moov::MovieHeader::to_payload(1000, 1_000),
+    )
+    .expect("infallible");
+    let data = container(*b"moov", vec![mvhd, trak1, trak2]).to_bytes();
+    let moov = mp4_core::container::find_top_level(&data, *b"moov").expect("moov");
+    assert_eq!(
+        mp4_core::read_video_dimensions_in(&moov),
+        Some((640, 360)),
+        "a zero-dimension track cannot shadow a real one"
+    );
+}
+
+#[test]
+fn the_windowed_sample_rate_reads_the_mp4a_entry() {
+    // An mp4a entry whose payload carries the rate as a 16.16 word at
+    // offset 24 (44100 = 0x0000AC44), inside an stsd the windowed reader
+    // walks trak → mdia → minf → stbl → stsd → entry.
+    let mut entry_payload = vec![0u8; 28];
+    entry_payload[24] = 0xAC; // 44100 as a 16.16 word: 0xAC440000
+    entry_payload[25] = 0x44;
+    let entry = leaf(*b"mp4a", entry_payload).expect("infallible");
+    let stsd = full_box_container_box(*b"stsd", vec![entry]);
+    let stbl = container(*b"stbl", vec![stsd]);
+    let minf = container(*b"minf", vec![stbl]);
+    let mdia = container(*b"mdia", vec![minf]);
+    let mvhd = leaf(
+        *b"mvhd",
+        mp4_core::moov::MovieHeader::to_payload(1000, 2_000),
+    )
+    .expect("infallible");
+    let trak = container(*b"trak", vec![mdia]);
+    let data = container(*b"moov", vec![mvhd, trak]).to_bytes();
+    let moov = mp4_core::container::find_top_level(&data, *b"moov").expect("moov");
+    assert_eq!(
+        mp4_core::read_sample_rate_in(&moov),
+        Some(44_100),
+        "the rate is the 16.16 word at payload offset 24"
     );
 }
