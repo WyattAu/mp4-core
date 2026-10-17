@@ -859,6 +859,34 @@ mod tests {
     }
 
     #[test]
+    fn an_ilst_atom_descends_so_its_data_children_are_visible() {
+        // The ilst namespace is descended into because its names are
+        // arbitrary codes — a metadata atom that stayed sealed would read
+        // as empty, which is why is_ilst_atom exists.
+        let data = container(
+            *b"ilst",
+            vec![leaf([0xA9, b'n', b'a', b'm'], b"name-bytes".to_vec()).expect("leaf")],
+        )
+        .to_bytes();
+        let boxes = parse_boxes(&data).expect("parses");
+        assert_eq!(boxes.len(), 1);
+        let ilst = &boxes[0];
+        assert!(ilst.is_container());
+        assert_eq!(ilst.children.len(), 1);
+        assert_eq!(ilst.children[0].box_type, [0xA9, b'n', b'a', b'm']);
+    }
+
+    #[test]
+    fn a_meta_box_descent_survives_a_childless_payload() {
+        // meta with a version+flags prefix and nothing after it: the skip
+        // must not read past the payload.
+        let data = full_box_container_box(*b"meta", vec![]).to_bytes();
+        let boxes = parse_boxes(&data).expect("parses");
+        assert_eq!(boxes.len(), 1);
+        assert!(boxes[0].children.is_empty());
+    }
+
+    #[test]
     fn empty_box_has_no_payload_and_containers_accept_children() {
         let e = empty(FOURCC_FREE);
         assert!(e.payload.is_empty());
