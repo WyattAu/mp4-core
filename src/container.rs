@@ -865,7 +865,7 @@ mod tests {
         // as empty, which is why is_ilst_atom exists.
         let data = container(
             *b"ilst",
-            vec![leaf([0xA9, b'n', b'a', b'm'], b"name-bytes".to_vec()).expect("leaf")],
+            vec![leaf(*b"data", b"opaque-value".to_vec()).expect("leaf")],
         )
         .to_bytes();
         let boxes = parse_boxes(&data).expect("parses");
@@ -873,7 +873,7 @@ mod tests {
         let ilst = &boxes[0];
         assert!(ilst.is_container());
         assert_eq!(ilst.children.len(), 1);
-        assert_eq!(ilst.children[0].box_type, [0xA9, b'n', b'a', b'm']);
+        assert_eq!(ilst.children[0].box_type, *b"data");
     }
 
     #[test]
