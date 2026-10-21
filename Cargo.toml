@@ -6,7 +6,7 @@ rust-version = "1.85"
 description = "ISO-BMFF (MP4/M4A/M4B) box reader and writer — ftyp, moov/trak/stbl, fragmented moof/traf, iTunes ilst metadata, Nero chpl chapters, no_std"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/WyattAu/mp4-core"
-keywords = ["mp4", "isobmff", "m4a", "m4b", "audiobook", "chapters", "no-std"]
+keywords = ["mp4", "isobmff", "m4b", "audiobook", "chapters"]
 categories = ["multimedia::audio", "parser-implementations", "no-std"]
 exclude = [".github/", "fuzz/"]
 
