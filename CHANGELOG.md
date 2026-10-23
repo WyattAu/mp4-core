@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to this project are documented here. Format: [Keep a
-Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
+Changelog](https://keepachangelog.com/): versions follow [semver](https://semver.org).
 
 ### Verified
 
@@ -13,14 +13,14 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
   describes and that this crate's writer reproduces it **byte for byte**.
 
   Byte-identity is stronger than "parses the same": if the bytes match, then everything
-  downstream — checksums, byte offsets, a muxer copying the box verbatim — behaves
+  downstream (checksums, byte offsets, a muxer copying the box verbatim) behaves
   identically too.
 
 - Two things about the format were only settled against the captured bytes while writing
   it, and both are now documented on the fixture rather than left in someone's head:
   the per-chapter start time is **eight** bytes wide, not four (invisible in the first
   chapter, which is zero), and the ticks are the **movie** timescale rather than a fixed
-  rate — ffmpeg emits 100 000 000 for ten seconds, which no fixed-rate assumption
+  rate: ffmpeg emits 100 000 000 for ten seconds, which no fixed-rate assumption
   explains.
 
   The fixture is generated from the captured hex rather than transcribed by hand, because
@@ -29,7 +29,7 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
 
 ### Added
 
-- **`io` — the box walk that finds a `moov` without reading a file.** `read_top_level`
+- **`io`: the box walk that finds a `moov` without reading a file.** `read_top_level`
   reads sixteen bytes per top-level box and skips the rest by declared size, so a
   64 MB `mdat` costs one header; `read_box` then fetches only the box wanted. A file
   larger than memory becomes readable, which for an audiobook library is the actual
@@ -48,7 +48,7 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
   is recorded here rather than implied by silence.
 
 - **`ByteReader`**, the random-access contract behind both: a length and a
-  fill-a-buffer-from-an-offset. Deliberately not `std::io::Read` — this crate is
+  fill-a-buffer-from-an-offset. Deliberately not `std::io::Read`: this crate is
   `no_std`, and a short read at the end of a file is a normal outcome rather than an
   error, which `Read`'s shape encourages callers to treat as one.
 
@@ -57,8 +57,8 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
 
 ### Verified
 
-- The windowed summary agrees with the whole-file summary on every field — duration,
-  title, artist, `chpl`, chapter track, track id — on a file shaped the way ffmpeg
+- The windowed summary agrees with the whole-file summary on every field: duration,
+  title, artist, `chpl`, chapter track, track id: on a file shaped the way ffmpeg
   writes them, `ftyp | mdat | moov` with the metadata at the end. That shape is the
   reason a head-only window cannot work.
 - Finding the `moov` of a 4 MB file costs under 8 KB of reads, asserted by a counting
@@ -76,7 +76,7 @@ A defect found by trying to write chapters into an M4B, which no test had done.
   payload, so the prefix was dropped on the way out.
 
   Reading never noticed, because reading parses the original bytes once and never
-  re-serializes them — every box still parsed, every chapter was still found, and the
+  re-serializes them: every box still parsed, every chapter was still found, and the
   whole suite was green. Writing exposed it immediately: a `moov` round-tripped through
   this module was short by the sum of the prefixes its full-box containers had dropped,
   and the M4B a muxer wrote from it was corrupt in a way no reader of the original would
@@ -87,8 +87,8 @@ A defect found by trying to write chapters into an M4B, which no test had done.
   and a `meta`, because a fix for one that misses the other would pass.
 
   Found from `audiobook-shelf`, whose M4B write path is the first thing in the estate to
-  re-serialize a parsed MP4. The failing assertion named the wrong suspect at first — a
-  length mismatch three boxes away from the box that lost the bytes — which is why the
+  re-serialize a parsed MP4. The failing assertion named the wrong suspect at first: a
+  length mismatch three boxes away from the box that lost the bytes: which is why the
   round-trip is now asserted on whole files rather than on individual boxes.
 
 ## [0.3.0] - 2026-10-05
@@ -99,18 +99,18 @@ is the mechanism most real chapter tracks use.
 
 ### Added
 
-- **`sample`** — a sample-table reader. Recovering a chapter track's titles *and* times
+- **`sample`**: a sample-table reader. Recovering a chapter track's titles *and* times
   needs four boxes, and each answers a question no other one can: `stts` for when each
   sample appears (`DT(i) = Σ delta(j)` over `j < i`, in the track's own timescale),
   `stsz` for how long each sample is, `stco`/`co64` for where each **chunk** starts, and
   `stsc` for how many samples are in each chunk.
-- **`chapter::read_text_track_chapters`** — titles and start times from a chapter
+- **`chapter::read_text_track_chapters`**: titles and start times from a chapter
   track. Each sample's *display time* is its chapter's start, per Apple's wording.
-- **`Mp4File::effective_chapters`** — the list a player would show, preferring the
+- **`Mp4File::effective_chapters`**: the list a player would show, preferring the
   chapter track over `chpl`. Not an arbitrary preference: **QuickTime, iTunes and the
   built-in iOS audiobook player read the track and ignore Nero chapters entirely**, so
   preferring `chpl` would mean preferring the mechanism those players discard.
-- **`Mp4File::chapter_disagreement`** — `Some` when a file carries both mechanisms and
+- **`Mp4File::chapter_disagreement`**: `Some` when a file carries both mechanisms and
   they differ. A muxer can write each from a different source; a library that silently
   prefers one shows the user a list the file contradicts, and neither list is *wrong* on
   its own, so a plain chapter comparison would pass.
@@ -119,13 +119,13 @@ is the mechanism most real chapter tracks use.
 
 `stco` gives **chunk** offsets, not sample offsets. Treating the first chunk offset as
 the first sample offset and adding sizes in sequence is correct only when every chunk
-holds the same number of samples and there is exactly one chunk — true of a one-chunk
+holds the same number of samples and there is exactly one chunk: true of a one-chunk
 chapter track, false of almost everything else. Worse, the failure is silent: a wrong
 offset yields bytes that look like text, so a reader reports *garbage titles* rather
 than an error.
 
-`co64` is likewise not exotic. It is the 64-bit form of `stco`, needed past 4 GB — a
-9-hour CD-quality audiobook, well inside the range real libraries hold — so a reader
+`co64` is likewise not exotic. It is the 64-bit form of `stco`, needed past 4 GB: a
+9-hour CD-quality audiobook, well inside the range real libraries hold: so a reader
 knowing only `stco` silently reads wrong bytes on exactly the largest files.
 
 ### Robustness
@@ -144,13 +144,13 @@ knowing only `stco` silently reads wrong bytes on exactly the largest files.
   there are two independent mechanisms.
 - **Chapters are reported in file order, not time order.** Sorting silently would hide
   a producer that wrote its chapters backwards, and the old `chapters` accessor did
-  exactly that — so a defect no consumer could see. `audiobook-core`'s `Title::validate`
+  exactly that: so a defect no consumer could see. `audiobook-core`'s `Title::validate`
   reports it instead.
 
 ## [0.2.1] - 2026-10-05
 
 The `chpl` reader was built from the Adobe FLV specification and could not read a
-single real chapter list. Found by generating one with ffmpeg and reading it back —
+single real chapter list. Found by generating one with ffmpeg and reading it back;
 a bug no amount of self-consistent testing could have caught, since the only `chpl`
 boxes the test suite had ever parsed were ones this crate had written itself.
 
@@ -166,7 +166,7 @@ boxes the test suite had ever parsed were ones this crate had written itself.
    (`version` `flags` `reserved(4)` `count`); version 0's is five. A reader that
    always skips four reads the count from the wrong offset for every version-0 file.
 
-`to_chpl_payload` now emits version 1 — the layout ffmpeg writes and TagLib reads —
+`to_chpl_payload` now emits version 1 (the layout ffmpeg writes and TagLib reads)
 and a test asserts our output is **byte-identical** to ffmpeg's, so a divergence
 between this crate and the most widely deployed writer fails loudly rather than
 producing files real players might reject.
@@ -181,7 +181,7 @@ producing files real players might reject.
   compatibility, because a library that silently drops the last forty chapters of a
   long book is worse than one that reports it cannot store them.
 - Tests built from **real captured ffmpeg bytes** rather than hand-written fixtures,
-  including one that pins the specification-shaped count reading as an empty list —
+  including one that pins the specification-shaped count reading as an empty list:
   the failure mode a specification-following writer produces, which is otherwise
   indistinguishable from a book with genuinely no chapters.
 - A parser guard: a count that cannot fit the box is an error rather than a clamp,
@@ -198,7 +198,7 @@ these are defects that made the crate silently wrong on real files.
 1. **Real `chpl` boxes are version 0, not version 1.** The Adobe FLV specification
    the format derives from describes version 1, but inspecting a real 20-hour M4B
    gives `chpl: version: 0, flags: 0, chapters: 54`. This crate required version 1
-   and therefore **discarded the chapter list of every Nero-written audiobook** —
+   and therefore **discarded the chapter list of every Nero-written audiobook**,
    and did so invisibly, because the file parsed fine and simply had no chapters.
    Both 0 and 1 are now accepted; only a version newer than either is refused,
    since its layout is unknown rather than merely uncommon.
@@ -207,7 +207,7 @@ these are defects that made the crate silently wrong on real files.
    tested against.
 2. **Chapter text samples begin with a two-byte length prefix.** Apple's QTFF and
    TN2174 both specify the sample as a 16-bit big-endian length followed by the
-   text, with no null terminator — "Chapter 1" is ten bytes, `00 09` then the text.
+   text, with no null terminator: "Chapter 1" is ten bytes, `00 09` then the text.
    Reading the whole sample as text returned a title beginning with two NULs, which
    every UI renders as `\ufffd\ufffdChapter 1`. The prefix is now stripped when it
    is consistent with the sample and ignored when it is not, so the encoders that
@@ -225,10 +225,10 @@ these are defects that made the crate silently wrong on real files.
 
 ### Added
 
-- `chapter::is_chapter_list` — resolves a `chap` reference against the movie,
+- `chapter::is_chapter_list`: resolves a `chap` reference against the movie,
   accepting both the `tref` form and a bare `chap` under `udta` that some muxers
   emit.
-- `Mp4File::chapter_track_id` — the resolved chapter track, or `None`.
+- `Mp4File::chapter_track_id`: the resolved chapter track, or `None`.
 - Tests for all of the above, including one that had previously **asserted the
   bug**: `a_chapter_track_marks_a_file_as_an_audiobook` treated any text track as
   chapters and now pins the correct behaviour in both directions.
@@ -251,18 +251,18 @@ chapter track, so a library needs both.
 
 ### Added
 
-- **The box tree** (`container`) — all three size encodings (32-bit, 64-bit
+- **The box tree** (`container`): all three size encodings (32-bit, 64-bit
   `largesize`, and `size == 0` running to the end of the container), the `uuid`
   extended type, container descent through the known container set, recursive
   serialization that recomputes sizes, and a `walk` helper for deep lookups.
-- **File structure** (`moov`) — `ftyp` with its brand list, `mvhd`/`tkhd`/`mdhd`
+- **File structure** (`moov`): `ftyp` with its brand list, `mvhd`/`tkhd`/`mdhd`
   headers with both version-0 and version-1 field layouts, `hdlr` handler types,
   and a `Track` summary with durations already converted to milliseconds.
-- **iTunes metadata** (`metadata`) — `udta` → `meta` → `ilst`, with the `data`
+- **iTunes metadata** (`metadata`): `udta` → `meta` → `ilst`, with the `data`
   type flag modelled explicitly (UTF-8, UTF-16, JPEG, PNG, signed and unsigned
   integers), the well-known atom names, `stik` = 9 for audiobook detection, and
   `trkn` track/total extraction.
-- **Chapters** (`chapter`) — the Nero `chpl` box, read and write, with
+- **Chapters** (`chapter`): the Nero `chpl` box, read and write, with
   `sorted`, `chapter_at` (half-open intervals, last chapter open-ended), and
   `span_ms`; plus reading chapter titles out of a QuickTime text track's
   samples.
@@ -274,7 +274,7 @@ MP4-reader failures:
 
 1. **`meta` is a full box, not a plain container.** Its payload begins with
    version+flags before the child boxes, so a descent that read the first four
-   bytes as a box header saw `size == 0` — the "runs to end of file" form — and
+   bytes as a box header saw `size == 0` (the "runs to end of file" form) and
    swallowed every sibling as one opaque blob. `full_box_container` now marks
    it, and the descent strips those four bytes.
 2. **`ilst` atoms are containers with arbitrary names.** `©nam`, `covr`, `trkn`
@@ -283,7 +283,7 @@ MP4-reader failures:
    `©`-prefixed reserved namespace and the free-form one.
 3. **The `meta` full-box header, present or not, changes where the first child
    type sits.** Apple's writer omitted it for years, so detecting the
-   header-less form at offset zero was wrong — it has to be detected at offset
+   header-less form at offset zero was wrong: it has to be detected at offset
    four, because the payload then begins with a child's *size*.
 4. **Durations are per-box timescales.** `mvhd` and `mdhd` each carry a duration
    in their own timescale, which need not match. The conversion is explicit for

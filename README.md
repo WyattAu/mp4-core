@@ -1,9 +1,9 @@
 # mp4-core
 
-ISO-BMFF (MP4/M4A/M4B) box reader and writer for Rust — `ftyp`, `moov`/`trak`/`stbl`,
+ISO-BMFF (MP4/M4A/M4B) box reader and writer for Rust: `ftyp`, `moov`/`trak`/`stbl`,
 iTunes `ilst` metadata, Nero `chpl` chapters, `no_std`.
 
-**Layer:** L0 — leaf · **Estate deps:** none · **Runtime deps:** `thiserror`
+**Layer:** L0: leaf · **Estate deps:** none · **Runtime deps:** `thiserror`
 
 Part of the WyattAu estate's audio path: `id3-core` reads the tags in an MP3,
 `mp4-core` reads the box structure of an MP4, and an M4B is an MP4 with a
@@ -13,8 +13,8 @@ chapter track. See
 ## Why
 
 An audiobook library needs two things from a file: the chapters, and enough
-structure to serve or transcode it. Both live in different formats — `CHAP`/
-`CTOC` for MP3, `chpl` or a text track for MP4 — and neither is a library's job
+structure to serve or transcode it. Both live in different formats: `CHAP`/
+`CTOC` for MP3, `chpl` or a text track for MP4: and neither is a library's job
 to reimplement. The MP4 side is a box tree, which is small but has sharp edges:
 three size encodings, full-box containers, metadata atoms whose names are
 arbitrary four-byte codes, and durations in per-box timescales.
@@ -114,12 +114,12 @@ if let Some(cover) = file.metadata.cover() {
 - **A subtitle track is not a chapter track.** Apple's QTFF: "It is the 'chap'
   track reference that makes the text track into a chapter list." Without that
   reference the text track is captions, subtitles, or lyrics.
-- **Malformed chapters are rejected, not guessed** — a `chpl` version newer than
+- **Malformed chapters are rejected, not guessed**: a `chpl` version newer than
   either known layout, a non-zero reserved field, or a title running past the box.
 
 ## Gates
 
-- `cargo test` — 25 tests (7 unit, 17 integration, 1 doc)
+- `cargo test`: 25 tests (7 unit, 17 integration, 1 doc)
 - `cargo clippy --all-features --all-targets -- -D warnings`
 - `cargo fmt --check`
 - `cargo check --target thumbv7em-none-eabihf --no-default-features`
